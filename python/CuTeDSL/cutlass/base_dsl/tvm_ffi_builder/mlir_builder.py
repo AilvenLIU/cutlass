@@ -54,14 +54,6 @@ class MLIRTypeBuilder:
         """Convert the type to a type attribute."""
         return ir.TypeAttr.get(tp)
 
-    def int_type(self, bits: int) -> ir.Type:
-        """Get the `i<bits>` type."""
-        return ir.IntegerType.get_signless(bits)
-
-    def uint_type(self, bits: int) -> ir.Type:
-        """Get the `ui<bits>` type."""
-        return ir.IntegerType.get_unsigned(bits)
-
     def struct_type(
         self,
         *,
@@ -93,10 +85,6 @@ class MLIRTypeBuilder:
         else:
             return llvm.StructType.new_identified(name, fields, packed=packed)
 
-    def identified_struct_type(self, name: str) -> ir.Type:
-        """Get a previously created identified struct type by its name."""
-        return llvm.StructType.get_identified(name)
-
     def func_type(self, *, params: Sequence[ir.Type] = (), ret: ir.Type) -> ir.Type:
         """Get a function type.
 
@@ -116,15 +104,6 @@ class MLIRTypeBuilder:
             "!llvm.func<{} ({})>".format(str(ret), ", ".join(map(str, params)))
         )  # did not find a programmatic way to get the function type
 
-    def global_dtor_entry_type(self) -> ir.Type:
-        """Get the type of the global destructor entry.
-
-        See Also:
-        - https://llvm.org/docs/LangRef.html#the-llvm-global-dtors-global-variable
-        - https://mlir.llvm.org/docs/Dialects/LLVM/#llvmmlirglobal_dtors-llvmglobaldtorsop
-        """
-        return self.struct_type(fields=[self.i32_type, self.ptr_type, self.ptr_type])
-
 
 class MLIRBuilder(MLIRTypeBuilder):
     """A builder for MLIR related types and operations.
@@ -134,6 +113,8 @@ class MLIRBuilder(MLIRTypeBuilder):
     If the statement terminates the current block, it will assign the new block to the current_block
     but not set the insersion point.
     """
+
+    MLIR_DYNAMIC_INDEX = -(2**31)
 
     def __init__(self) -> None:
         """Initialize the MLIR builder."""
@@ -286,7 +267,11 @@ class MLIRBuilder(MLIRTypeBuilder):
         return llvm.AddressOfOp(tp, name).result
 
     def getelementptr(
-        self, ptr: ir.Value, constant_indices: Sequence[int], elem_type: ir.Type
+        self,
+        ptr: ir.Value,
+        constant_indices: Sequence[int],
+        elem_type: ir.Type,
+        dynamic_indices: Sequence[ir.Value] = [],
     ) -> ir.Value:
         """Create a getelementptr operation.
 
@@ -294,10 +279,13 @@ class MLIRBuilder(MLIRTypeBuilder):
         ----------
         ptr : ir.Value
             The pointer to the element.
-        indices : Sequence[ir.Value]
-            The indices to the element.
+        constant_indices : Sequence[int]
+            The indices to the element. Use ``MLIR_DYNAMIC_INDEX`` as a
+            placeholder for an index taken from ``dynamic_indices`` instead.
         elem_type : ir.Type
             The type of the element.
+        dynamic_indices : Sequence[ir.Value], optional
+            Runtime index values.
 
         Returns
         -------
@@ -308,7 +296,7 @@ class MLIRBuilder(MLIRTypeBuilder):
             return llvm.getelementptr(
                 self.ptr_type,
                 ptr,
-                [],
+                dynamic_indices,
                 raw_constant_indices=ir.DenseI32ArrayAttr.get(constant_indices),
                 elem_type=elem_type,
                 **self.get_element_extra_kwargs,
@@ -319,11 +307,20 @@ class MLIRBuilder(MLIRTypeBuilder):
             return llvm.getelementptr(
                 self.ptr_type,
                 ptr,
-                [],
+                dynamic_indices,
                 raw_constant_indices=ir.DenseI32ArrayAttr.get(constant_indices),
                 elem_type=elem_type,
                 **self.get_element_extra_kwargs,
             )
+
+    def offset_ptr_bytes(self, ptr: ir.Value, byte_offset: ir.Value) -> ir.Value:
+        """Displace ``ptr`` by a runtime number of bytes."""
+        return self.getelementptr(
+            ptr,
+            [self.MLIR_DYNAMIC_INDEX],
+            self.i8_type,
+            dynamic_indices=[byte_offset],
+        )
 
     def return_(self, ret: Optional[ir.Value] = None) -> None:
         """Create a return statement."""

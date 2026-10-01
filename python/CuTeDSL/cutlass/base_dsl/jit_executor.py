@@ -13,14 +13,14 @@
 This module provides jit executor related classes.
 
 Pointer-address runtime arguments are opt-in. A compile-time example such as
-``nullptr(dtype, space)`` marks the corresponding runtime argument as a
+``cute.runtime.nullptr(dtype, space)`` marks the corresponding runtime argument as a
 pointer slot, and
-``ExecutionArgs.record_pointer_arg_specs_from_compile_args`` records that
+``ExecutionArgs.record_arg_specs_from_compile_args`` records that
 metadata in ``_pointer_address_arg_specs``. Runtime calls may then pass an
 integer address, ``ctypes.c_void_p``, a ctypes pointer object, or
-``nullptr(...)`` for a null address. Native JIT execution packs raw
+``cute.runtime.nullptr(...)`` for a null address. Native JIT execution packs raw
 addresses into stable ``ctypes.c_void_p`` storage via ``_RuntimePointerArg``;
-``nullptr(...)`` already provides that storage itself and is retained as a
+``cute.runtime.nullptr(...)`` already provides that storage itself and is retained as a
 keepalive when used as a temporary runtime argument. TVM FFI receives raw
 integer addresses instead.
 
@@ -38,12 +38,24 @@ import array
 import ctypes
 import inspect
 import io
-from typing import Any, NamedTuple, TYPE_CHECKING, ClassVar, cast, get_args, get_origin
+from typing import (
+    Any,
+    Literal,
+    NamedTuple,
+    TYPE_CHECKING,
+    ClassVar,
+    TypeVar,
+    cast,
+    get_args,
+    get_origin,
+    overload,
+)
 from collections.abc import Callable, Sequence
 import weakref
 import threading
 import collections
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 
@@ -107,6 +119,34 @@ def get_escaped_cubin_bytes(cubin_data: bytes) -> bytes:
     return bytes(converted)
 
 
+def _decode_gpu_binary_cubin(raw_bytecode: bytes) -> bytes:
+    """Extract and unescape the cubin payload from a serialized ``gpu.binary`` op.
+
+    The op's bytecode embeds the cubin as ``bin = "...">``; this slices that out
+    and converts the escaped MLIR bytes back into executable binary bytes.
+    """
+    cubin_data = raw_bytecode.split(b'bin = "')[1].split(b'">')[0]
+    return get_escaped_cubin_bytes(cubin_data)
+
+
+def _make_cuda_module_and_kernel(
+    cuda_module: Any, sym: str, func_sym: str, attrs: dict[Any, int]
+) -> CudaModuleAndKernel:
+    """Resolve ``func_sym`` in a loaded CUDA module and wrap it with launch attrs.
+
+    ``attrs`` is copied before the driver-version-gated non-portable-cluster-size
+    attribute is added, so a shared ``kernel_info`` entry passed in by the caller
+    is never mutated in place.
+    """
+    kernel = cuda_helpers.get_library_kernel(cuda_module, func_sym)
+    attrs = dict(attrs)
+    if cuda_helpers.get_driver_version() >= 11080:
+        attrs[
+            cuda_helpers.cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED
+        ] = 1
+    return CudaModuleAndKernel(sym, cuda_module, kernel, attrs)
+
+
 def walk_module_and_get_cubin_data(
     module: ir.Module, sym: str, callback: Callable[[str, str, bytes], None]
 ) -> None:
@@ -128,8 +168,7 @@ def walk_module_and_get_cubin_data(
         if sym == op.opview.sym_name.value and not sym.endswith("_kernel"):
             func_sym = sym.rsplit("_", 1)[0]
 
-        cubin_data = cubin_data.split(b'bin = "')[1].split(b'">')[0]
-        cubin_data = get_escaped_cubin_bytes(cubin_data)
+        cubin_data = _decode_gpu_binary_cubin(cubin_data)
         callback(sym, func_sym, cubin_data)
         return ir.WalkResult.ADVANCE
 
@@ -156,17 +195,9 @@ def load_kernels_from_ir_module(
                 log().debug(f"Skipping already loaded symbol: {sym}")
 
             cubin_module = cuda_helpers.load_library_data(cubin_data)
-            kernel = cuda_helpers.get_library_kernel(cubin_module, func_sym)
-
-            # Setup attributes we want applied to the loaded kernel functions.
-            # A copy is made so we can update one of the attributes.
-            attrs = dict(kernel_info[sym])
-            if cuda_helpers.get_driver_version() >= 11080:
-                attrs[
-                    cuda_helpers.cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED
-                ] = 1
-
-            kernel_modules[sym] = CudaModuleAndKernel(sym, cubin_module, kernel, attrs)
+            kernel_modules[sym] = _make_cuda_module_and_kernel(
+                cubin_module, sym, func_sym, kernel_info[sym]
+            )
 
         walk_module_and_get_cubin_data(module, sym, walk_callback)
 
@@ -358,11 +389,13 @@ class ExecutionArgs:
 
     Besides normal signature rectification and scalar casting, this class owns
     the pointer-address conversion contract.
-    ``record_pointer_arg_specs_from_compile_args`` derives a lightweight spec
+    ``record_arg_specs_from_compile_args`` derives a lightweight spec
     tree from compile-time arguments, and
     ``generate_execution_args`` / ``convert_python_pointer_args_for_tvm_ffi`` use
     that spec to decide where Python pointer-like values may replace runtime
-    pointer objects. Extra tail arguments are outside the signature and have no
+    pointer objects. ``adapter_scope`` is retained so later runtime calls use the
+    same dialect-specific argument adapters as compilation, including for nested
+    containers. Extra tail arguments are outside the signature and have no
     ``name_to_index`` entry or compile-example spec; only explicit ctypes
     pointer objects are repacked there.
     """
@@ -372,6 +405,7 @@ class ExecutionArgs:
         signature: inspect.Signature,
         function_name: str,
         full_arg_check: bool = False,
+        adapter_scope: str | None = None,
     ) -> None:
         self.function_name = function_name
         self.signature = self.filter_runtime_signature(signature)
@@ -382,18 +416,32 @@ class ExecutionArgs:
             None
         ] * self._meta.arg_count
         self._has_pointer_address_arg_specs = False
+        # Whether the function was compiled with ``None`` in each argument slot,
+        # or "unknown" when the compile-time arguments were not recorded.
+        self._compiled_with_none: list[Any] = ["unknown"] * self._meta.arg_count
         # When True (set when debugging mode is ON), generate_execution_args
         # runs thorough per-argument validation that is otherwise skipped to
         # keep the launch path fast.
         self._full_arg_check = full_arg_check
+        self._jit_arg_adapter_scope = adapter_scope
         self._tls = threading.local()
+
+    def set_adapter_scope(self, adapter_scope: str | None) -> None:
+        """Select adapters for the DSL that compiled this function.
+
+        Reset the per-thread adapter cache so changing the scope can never reuse
+        a callable selected for a different dialect.
+        """
+        if adapter_scope != self._jit_arg_adapter_scope:
+            self._jit_arg_adapter_scope = adapter_scope
+            self._tls = threading.local()
 
     @property
     def has_pointer_address_arg_specs(self) -> bool:
         """Whether this compiled signature has pointer-address conversion slots."""
         return self._has_pointer_address_arg_specs
 
-    def record_pointer_arg_specs_from_compile_args(
+    def record_arg_specs_from_compile_args(
         self, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
         """Record pointer conversion metadata from compile-time arguments.
@@ -404,7 +452,7 @@ class ExecutionArgs:
         or a nested list/tuple spec for sequence arguments.
 
         ``_pointer_address_spec_from_compile_arg`` marks explicit pointer
-        arguments such as ``nullptr(...)`` and ctypes pointer objects. Plain
+        arguments such as ``cute.runtime.nullptr(...)`` and ctypes pointer objects. Plain
         ``int`` compile-time arguments are marked only when the corresponding
         annotation is pointer-shaped; this keeps scalar integer parameters from
         being packed as pointer slots. For mixed tuple annotations, element
@@ -412,6 +460,12 @@ class ExecutionArgs:
         such as
         ``list[cutlass.Pointer]`` or ``Sequence[cutlass.Pointer]``, the inner annotation
         is applied to each element.
+
+        The same pass records ``_compiled_with_none``, marking which slots held
+        ``None``. Tracing takes ``None`` as a constexpr and folds it into the
+        kernel, so those slots carry no runtime argument; ``_validate_args_full``
+        needs to tell them apart from slots the kernel really does expect an
+        argument for, which the annotation cannot say.
 
         ``args``/``kwargs`` are first rectified through the function signature
         unless they already exactly match the positional runtime shape. That
@@ -432,6 +486,7 @@ class ExecutionArgs:
             )
             for index, arg in enumerate(input_args)
         ]
+        self._compiled_with_none = [arg is None for arg in input_args]
         self._has_pointer_address_arg_specs = any(
             spec is not None for spec in self._pointer_address_arg_specs
         )
@@ -599,6 +654,20 @@ class ExecutionArgs:
 
         return rectified
 
+    def bound_call_arguments(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        """THIS call's launch binding as name->value facts: the same tail-arg
+        slice and rectification ``_generate_execution_args`` performs, keyed
+        by the filtered runtime signature's parameter names."""
+        n = self._meta.arg_count
+        head = args[:n] if len(args) > n else args
+        if not kwargs and len(head) == n:
+            input_args: Sequence[Any] = head
+        else:
+            input_args = self.get_rectified_args(head, kwargs)
+        return dict(zip(self._meta.all_names, input_args))
+
     def generate_execution_args(
         self, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[list[Any], list[Any]]:
@@ -606,6 +675,29 @@ class ExecutionArgs:
         This function is the prune version of `generate_mlir_function_types` which only generates execution args
         to get rid of mlir context.
         """
+        return self._generate_execution_args(args, kwargs)
+
+    @staticmethod
+    def _adapt_and_get_c_pointers(
+        arg: Any, cache: dict[type, Any], adapted_args: list[Any]
+    ) -> list[ctypes.c_void_p]:
+        """Resolve, apply, and marshal an adapter in the active scope."""
+        arg_type = type(arg)
+        adapter = cache.get(arg_type)
+        if adapter is None:
+            adapter = JitArgAdapterRegistry.get_registered_adapter(arg)
+            if adapter is not None:
+                cache[arg_type] = adapter
+
+        if adapter is not None:
+            arg = adapter(arg)
+            adapted_args.append(arg)
+
+        return get_c_pointers(arg)
+
+    def _generate_execution_args(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[list[Any], list[Any]]:
         n = self._meta.arg_count
         extra_args = args[n:] if len(args) > n else ()
         args = args[:n] if len(args) > n else args
@@ -626,7 +718,9 @@ class ExecutionArgs:
             input_args = self.get_rectified_args(args, kwargs)
 
         if self._full_arg_check:
-            self._validate_args_full(input_args)
+            JitArgAdapterRegistry.call_with_scope(
+                self._jit_arg_adapter_scope, self._validate_args_full, input_args
+            )
 
         for index, arg in enumerate(input_args):
             pointer_arg, is_pointer_address = _convert_python_pointer_arg(
@@ -646,19 +740,14 @@ class ExecutionArgs:
                 arg = t.cast(arg, self._meta.annotated_types[index])  # type: ignore[arg-type]
                 exe_arg_chunks[index] = get_c_pointers(arg)
             else:
-                arg_type = type(arg)
                 cache = adapter_caches[index]
-                adapter = cache.get(arg_type)
-                if adapter is None:
-                    adapter = JitArgAdapterRegistry.get_registered_adapter(arg)
-                    if adapter is not None:
-                        cache[arg_type] = adapter
-
-                if adapter is not None:
-                    arg = adapter(arg)
-                    adapted_args.append(arg)
-
-                exe_arg_chunks[index] = get_c_pointers(arg)
+                exe_arg_chunks[index] = JitArgAdapterRegistry.call_with_scope(
+                    self._jit_arg_adapter_scope,
+                    self._adapt_and_get_c_pointers,
+                    arg,
+                    cache,
+                    adapted_args,
+                )
 
         exe_args = [p for chunk in exe_arg_chunks for p in chunk]  # type: ignore[union-attr]
 
@@ -733,6 +822,22 @@ class ExecutionArgs:
             name = meta.all_names[index] if index < len(meta.all_names) else f"#{index}"
             spec = self._pointer_address_arg_specs[index]
 
+            # A parameter compiled with `None` was baked in as a constexpr, so `None` is the only value
+            # it can take, and marshalling it to zero C pointers is correct.
+            compiled_with_none = self._compiled_with_none[index]
+            if compiled_with_none is True:
+                if arg is not None:
+                    raise DSLUserCodeError(
+                        DiagId.ARG_CONSTEXPR_MISMATCH,
+                        arg_name=name,
+                        arg_type=type(arg).__name__,
+                        context={"position": index},
+                    )
+                continue
+
+            # Skip validation if not recorded.
+            if arg is None and compiled_with_none == "unknown":
+                continue
             # Numeric scalars must be number-like so the later t.cast succeeds;
             # only reject clearly non-numeric values to avoid false positives on
             # the DSL's own numeric wrapper types.
@@ -891,6 +996,42 @@ class ExecutionArgs:
         return constexpr_args
 
 
+# Callbacks invoked with a library handle (int) right before that CUDA library
+# is unloaded. External runtimes that registered the library (e.g. NVSHMEM)
+# hook in here to drop their references while the handle is still valid.
+_library_unload_callbacks: list[Callable[[int], None]] = []
+
+
+def register_library_unload_callback(
+    callback: Callable[[int], None],
+) -> Callable[[int], None]:
+    """Register a callback invoked with the CUlibrary handle (int) right
+    before the DSL unloads that library. Callbacks may run on any thread,
+    must be idempotent, and exceptions they raise are logged and ignored.
+    Returns the callback so it can be used as a decorator."""
+    _library_unload_callbacks.append(callback)
+    return callback
+
+
+def unregister_library_unload_callback(callback: Callable[[int], None]) -> None:
+    """Remove a registered unload callback; unknown callbacks are ignored."""
+    try:
+        _library_unload_callbacks.remove(callback)
+    except ValueError:
+        pass
+
+
+def _notify_library_unload(handle: int) -> None:
+    for callback in list(_library_unload_callbacks):
+        try:
+            callback(handle)
+        except Exception:
+            log().warning(
+                f"library unload callback {callback!r} raised for handle "
+                f"{handle:#x}; continuing"
+            )
+
+
 class JitExecuteContext:
     """Holds device specific context for execution."""
 
@@ -964,15 +1105,36 @@ class JitModule:
     def unload(self) -> None:
         try:
             for m in set([m.cuda_module for m in self.cuda_modules]):
+                # Notify subscribers (e.g. NVSHMEM interop) while the handle is
+                # still valid so they can drop their references first.
+                _notify_library_unload(int(m))
                 cuda_helpers.unload_library(m)
             self.cuda_modules.clear()
-        except Exception as e:
+        except Exception:
             pass
         finally:
             self._unloaded = True
 
     def __del__(self) -> None:
-        self.unload()
+        # At interpreter shutdown leave libraries to the driver: unload
+        # callbacks and driver calls are not safe during teardown.
+        if not sys.is_finalizing():
+            self.unload()
+
+
+def _pyir_validate_spec_reentry(
+    spec: "tuple | None",
+    execution_args: "ExecutionArgs | None",
+    args: tuple,
+    kwargs: dict,
+) -> None:
+    """Lazy hook into the F-SPEC re-entry engine (pyir_spec); a handle with
+    no sealed spec never imports the engine."""
+    if spec is None:
+        return
+    from .pyir_spec import _pyir_validate_spec_reentry as _validate
+
+    _validate(spec, execution_args, args, kwargs)
 
 
 class JitExecutor:
@@ -987,12 +1149,16 @@ class JitExecutor:
         jit_module: JitModule | Any,
         exec_context: JitExecuteContext | None,
         jit_time_profiling: bool,
+        spec: "tuple | None" = None,
     ) -> None:
         # JitExecutor will keep JitCompiledFunction alive so that the underlying
         # ExecutionEngine and module data is not discarded until runtime callables
         # are garbage collected.
         self.jit_module = jit_module
         self.exec_context = exec_context
+        # F-SPEC: (record, complete, entry_func, receiver) sealed by the trace that
+        # produced this module; validated at every __call__ re-entry.
+        self._pyir_spec = spec
         self.profiler = timer(enable=jit_time_profiling) if jit_time_profiling else None
 
         # Get the cuda result type from the capi function.
@@ -1002,7 +1168,6 @@ class JitExecutor:
 
         # Pre-compute flags
         self._has_cuda_result = self.cuda_result is not None
-        self._has_profiler = self.profiler is not None
         self._cuda_result_addr = (
             ctypes.addressof(self.cuda_result) if self._has_cuda_result else None  # type: ignore[arg-type]
         )
@@ -1077,15 +1242,22 @@ class JitExecutor:
             error_code = self.cuda_result.value  # type: ignore[union-attr]
             if error_code == 0:
                 return error_code
-            raise cuda_helpers.create_cuda_runtime_error(error_code)
+            raise cuda_helpers.create_cuda_runtime_error(
+                error_code, cuda_helpers.cudart.cudaError_t
+            )
         except DSLCudaRuntimeError as e:
             raise e
         except Exception as e:
             raise DSLRuntimeError(f"💥💥💥 Runtime Crash 💥💥💥", cause=e)
 
-        return None
-
     def __call__(self, *args: Any, **kwargs: Any) -> int | None:
+        if self._pyir_spec is not None:
+            _pyir_validate_spec_reentry(
+                self._pyir_spec,
+                getattr(self.jit_module, "execution_args", None),
+                args,
+                kwargs,
+            )
         exe_args, adapted_args = self.generate_execution_args(*args, **kwargs)
         return self.run_compiled_program(exe_args)
 
@@ -1102,31 +1274,29 @@ class JitFunctionArtifacts:
     device_header: str | None = None
     device_object_path: str | None = None
 
+    @staticmethod
+    def _read_artifact_file(path: str, label: str, *, binary: bool = False) -> Any:
+        """Read an artifact file, wrapping IO errors in a DSLRuntimeError."""
+        try:
+            with open(path, "rb" if binary else "r") as f:
+                return f.read()
+        except (IOError, OSError) as e:
+            raise DSLRuntimeError(f"Failed to read {label} file {path!r}: {e}")
+
     def __post_init__(self) -> None:
-        if self.PTX is not None and os.path.exists(self.PTX):
-            try:
-                with open(self.PTX, "r") as f:
-                    self.PTX = f.read()
-            except (IOError, OSError) as e:
-                raise DSLRuntimeError(f"Failed to read PTX file '{self.PTX}': {e}")
-        if self.CUBIN is not None and os.path.exists(self.CUBIN):
-            try:
-                with open(self.CUBIN, "rb") as f:
-                    self.CUBIN = f.read()
-            except (IOError, OSError) as e:
-                raise DSLRuntimeError(f"Failed to read CUBIN file {self.CUBIN!r}: {e}")
-        if self.SASS is not None and os.path.exists(self.SASS):
-            try:
-                with open(self.SASS, "r") as f:
-                    self.SASS = f.read()
-            except (IOError, OSError) as e:
-                raise DSLRuntimeError(f"Failed to read SASS file '{self.SASS}': {e}")
-        if self.MLIR is not None and os.path.exists(self.MLIR):
-            try:
-                with open(self.MLIR, "r") as f:
-                    self.MLIR = f.read()
-            except (IOError, OSError) as e:
-                raise DSLRuntimeError(f"Failed to read MLIR file '{self.MLIR}': {e}")
+        # (attribute name, human label, binary?). CUBIN is the only binary read.
+        text_fields = [
+            ("PTX", "PTX", False),
+            ("CUBIN", "CUBIN", True),
+            ("SASS", "SASS", False),
+            ("MLIR", "MLIR", False),
+        ]
+        for attr, label, binary in text_fields:
+            path = getattr(self, attr)
+            if path is not None and os.path.exists(path):
+                setattr(
+                    self, attr, self._read_artifact_file(path, label, binary=binary)
+                )
 
 
 @dataclass
@@ -1160,10 +1330,14 @@ class AuxRuntimeFunc(abc.ABC):
         """
 
 
+AuxRuntimeFuncT = TypeVar("AuxRuntimeFuncT", bound=AuxRuntimeFunc)
+
+
 class JitCompiledFunction:
     """Holds a compiled function."""
 
     export_provider: ExportProvider | None = None
+    _jit_arg_adapter_scope = JitArgAdapterRegistry.GPU_DIALECT_SCOPE
 
     def __init__(
         self,
@@ -1196,9 +1370,12 @@ class JitCompiledFunction:
             if self.export_provider is not None:
                 full_arg_check = self.export_provider.dsl._get_dsl().envar.debug
             self.execution_args = ExecutionArgs(
-                signature, self.function_name, full_arg_check=full_arg_check
+                signature,
+                self.function_name,
+                full_arg_check=full_arg_check,
+                adapter_scope=self._jit_arg_adapter_scope,
             )
-            self.execution_args.record_pointer_arg_specs_from_compile_args(
+            self.execution_args.record_arg_specs_from_compile_args(
                 tuple(dynamic_args or ()), dynamic_kwargs or {}
             )
         self.jit_time_profiling = jit_time_profiling
@@ -1227,6 +1404,11 @@ class JitCompiledFunction:
         self.jit_module: JitModule | None = None
         self._executor_lock = threading.RLock()
         self._default_executor: JitExecutor | None = None
+
+        # F-SPEC: (record, complete, entry_func, receiver) sealed by the producing
+        # trace; validated at __call__ re-entry on this handle and propagated
+        # to every executor derived from it.
+        self._pyir_spec: "tuple | None" = None
 
         # This is used to do early generation of the c header arguments to release the reference to the dynamic arguments.
         self._generate_c_header_arguments(dynamic_args, dynamic_kwargs)
@@ -1277,12 +1459,9 @@ class JitCompiledFunction:
         )
         assert self.kernel_info is not None
         for sym, attrs in self.kernel_info.items():
-            kernel = cuda_helpers.get_library_kernel(cubin_module, sym)
-            if cuda_helpers.get_driver_version() >= 11080:
-                attrs[
-                    cuda_helpers.cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED
-                ] = 1
-            kernel_modules[sym] = CudaModuleAndKernel(sym, cubin_module, kernel, attrs)
+            kernel_modules[sym] = _make_cuda_module_and_kernel(
+                cubin_module, sym, sym, attrs
+            )
         return list(kernel_modules.values())
 
     def _validate_engine(self) -> None:
@@ -1318,34 +1497,65 @@ class JitCompiledFunction:
             # Create a new executor that will be tied to a device context
             # n.b. host only modules do not load device specific modules or context.
             context = self.jit_module.get_device_execute_context(device)
-            return JitExecutor(self.jit_module, context, self.jit_time_profiling)
+            return JitExecutor(
+                self.jit_module,
+                context,
+                self.jit_time_profiling,
+                spec=self._pyir_spec,
+            )
 
     def generate_execution_args(
         self, *args: Any, **kwargs: Any
     ) -> tuple[list[Any], list[Any]]:
         return self.execution_args.generate_execution_args(args, kwargs)
 
+    @overload
     def get_aux_func(
-        self, func_class: type[AuxRuntimeFunc], kernel: Callable[..., Any]
-    ) -> AuxRuntimeFunc:
-        """Look up and return an auxiliary runtime function for a specific kernel.
+        self,
+        func_class: type[AuxRuntimeFuncT],
+        kernel: Callable[..., Any] | None = None,
+        *,
+        required: Literal[True] = True,
+    ) -> AuxRuntimeFuncT: ...
 
-        ``kernel`` must be a ``@dsl_name.kernel``-annotated callable that was called
-        inside the ``@dsl_name.jit`` function that produced this compiled object.
-        The lookup resolves the symbol ``{kernel_name}_{func_class.name}`` for
-        that specific kernel.
+    @overload
+    def get_aux_func(
+        self,
+        func_class: type[AuxRuntimeFuncT],
+        kernel: Callable[..., Any] | None = None,
+        *,
+        required: Literal[False],
+    ) -> AuxRuntimeFuncT | None: ...
+
+    def get_aux_func(
+        self,
+        func_class: type[AuxRuntimeFuncT],
+        kernel: Callable[..., Any] | None = None,
+        *,
+        required: bool = True,
+    ) -> AuxRuntimeFuncT | None:
+        """Look up and return an auxiliary runtime function.
+
+        When ``kernel`` is provided, resolves
+        ``{kernel_name}_{func_class.name}``. Otherwise, resolves
+        ``func_class.name`` directly.
 
         :param func_class: A subclass of :class:`AuxRuntimeFunc` whose
-            ``name`` class attribute identifies the host function suffix.
-        :param kernel: A ``@dsl_name.kernel``-annotated callable.  Must have been
-            called at least once inside a ``@dsl_name.jit`` function so that
-            ``_dsl_kernel_name`` is set.
+            ``name`` class attribute identifies the full symbol when ``kernel``
+            is omitted or the host function suffix when ``kernel`` is provided.
+        :param kernel: An optional ``@dsl_name.kernel``-annotated callable. If
+            provided, it must have been called at least once inside a
+            ``@dsl_name.jit`` function so that ``_dsl_kernel_name`` is set.
+        :param required: Whether an unavailable auxiliary function is an error.
+            If false, a missing execution engine or symbol returns ``None``.
         :return: An instance of ``func_class`` initialised with the matched
-            function pointer and ready to call.
+            function pointer, or ``None`` when the symbol is not required and
+            is absent.
         :raises TypeError: If ``func_class`` is not a subclass of
             :class:`AuxRuntimeFunc`.
         :raises ValueError: If ``kernel`` has no ``_dsl_kernel_name`` attribute.
-        :raises DSLRuntimeError: If no matching symbol is found in the JIT engine.
+        :raises DSLRuntimeError: If ``required`` is true and the execution
+            engine is unavailable or no matching symbol is found in it.
         """
         if not (
             isinstance(func_class, type) and issubclass(func_class, AuxRuntimeFunc)
@@ -1354,20 +1564,26 @@ class JitCompiledFunction:
                 f"func_class must be a subclass of AuxRuntimeFunc, got {func_class!r}"
             )
 
-        # Unwrap bound methods then @wraps wrappers to reach the original funcBody.
-        func_body = getattr(kernel, "__func__", kernel)  # bound method → function
-        func_body = getattr(func_body, "__wrapped__", func_body)  # jit_wrapper → func
-        kernel_name = getattr(func_body, "_dsl_kernel_name", None)
-        if kernel_name is None:
-            raise ValueError(
-                f"kernel {kernel!r} has no '_dsl_kernel_name' attribute. "
-                "Make sure it has been called at least once inside a @cute.jit function."
-            )
+        sym_name = func_class.name
+        candidate = sym_name
+        if kernel is not None:
+            # Unwrap bound methods then @wraps wrappers to reach the original funcBody.
+            func_body = getattr(kernel, "__func__", kernel)
+            func_body = getattr(func_body, "__wrapped__", func_body)
+            kernel_name = getattr(func_body, "_dsl_kernel_name", None)
+            if kernel_name is None:
+                raise ValueError(
+                    f"kernel {kernel!r} has no '_dsl_kernel_name' attribute. "
+                    "Make sure it has been called at least once inside a "
+                    "@cute.jit function."
+                )
+            candidate = f"{kernel_name}_{sym_name}"
+
+        if self.engine is None and not required:
+            return None
 
         self._validate_engine()
 
-        sym_name = func_class.name
-        candidate = f"{kernel_name}_{sym_name}"
         candidates = [candidate]
         if self.prefix is not None:
             candidates = [f"_mlir_{self.prefix}_{candidate}"] + candidates
@@ -1379,11 +1595,18 @@ class JitCompiledFunction:
                 break
 
         if not fn_ptr:
+            if not required:
+                return None
             raise DSLRuntimeError(
                 f"Host function '{sym_name}' not found in JIT engine. "
                 f"Tried: {candidates}"
             )
         return func_class(fn_ptr, self.execution_args)
+
+    def seal_specialization(self, spec: "tuple | None") -> None:
+        """Attach the producing trace's F-SPEC (record, complete, entry_func, receiver);
+        __call__ re-entries on this handle validate against it (V-11)."""
+        self._pyir_spec = spec
 
     def __call__(self, *args: Any, **kwargs: Any) -> int | None:
         """Executes the jit-compiled function under the currently active CUDA context.
@@ -1392,6 +1615,13 @@ class JitCompiledFunction:
         CUDA errors. If you need to call the kernel on multiple devices use `to`
         to return a per-device function.
         """
+        if self._pyir_spec is not None:
+            _pyir_validate_spec_reentry(
+                self._pyir_spec,
+                getattr(self, "execution_args", None),
+                args,
+                kwargs,
+            )
         exe_args, adapted_args = self.execution_args.generate_execution_args(
             args, kwargs
         )
@@ -1490,9 +1720,7 @@ class JitCompiledFunction:
                 s = io.BytesIO()
                 op.operation.write_bytecode(s)
                 nonlocal cubin_data
-                cubin_data = s.getvalue()
-                cubin_data = cubin_data.split(b'bin = "')[1].split(b'">')[0]
-                cubin_data = get_escaped_cubin_bytes(cubin_data)
+                cubin_data = _decode_gpu_binary_cubin(s.getvalue())
                 op.erase()
                 return ir.WalkResult.ADVANCE
             return ir.WalkResult.ADVANCE
@@ -1507,7 +1735,7 @@ class JitCompiledFunction:
                 ir.Location.unknown(),
                 ir.InsertionPoint(export_module.body),
             ):
-                new_binary_global_op = llvm.GlobalOp(
+                llvm.GlobalOp(
                     sym_name="_".join([function_prefix, cubin_suffix]),
                     global_type=ir.Type.parse(f"!llvm.array<{len(cubin_array)} x i8>"),
                     linkage=ir.Attribute.parse("#llvm.linkage<external>"),
@@ -1520,16 +1748,20 @@ class JitCompiledFunction:
         # Generate the object file
 
         try:
-            with tempfile.NamedTemporaryFile() as tmp_object_file:
+            # A directory rather than NamedTemporaryFile: Windows opens the
+            # latter exclusively, so neither the writer below nor the reopen
+            # can touch it while the handle is alive.
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_object_path = os.path.join(tmp_dir, "module.o")
                 self.export_provider.mlirExecutionEngine.dump_object_file_pic(
                     export_module,
-                    tmp_object_file.name,
+                    tmp_object_path,
                     "_".join([function_prefix, self.function_name]),
                     host_triple=self.host_target.triple,
                     host_cpu=self.host_target.cpu,
                     host_features=self.host_target.features,
                 )
-                with open(tmp_object_file.name, "rb") as f:
+                with open(tmp_object_path, "rb") as f:
                     ret = f.read()
                 return ret
         except Exception as e:

@@ -53,6 +53,25 @@ from .diagnostics import DiagId
 from .utils.logger import log
 
 
+_AstNode = TypeVar("_AstNode", bound=ast.AST)
+
+
+def _deepcopy_ast_root(node: _AstNode) -> _AstNode:
+    """Copy an AST subtree without following an external parent link.
+
+    Some callers annotate nodes with ``_parent`` for diagnostics. A regular
+    ``deepcopy`` then walks the entire enclosing function or module when only
+    a small expression or target is needed. Preserve parent links within the
+    copied subtree, but detach the copied root from its original owner.
+    """
+    parent = getattr(node, "_parent", None)
+    memo = {id(parent): None} if isinstance(parent, ast.AST) else None
+    copied = deepcopy(node, memo)
+    if hasattr(copied, "_parent"):
+        delattr(copied, "_parent")
+    return copied
+
+
 class OrderedSet:
     """
     A deterministic set implementation for ordered operations.
@@ -99,43 +118,6 @@ class OrderedSet:
                     result.add(key)
                     break
         return result
-
-
-@dataclass
-class ImportInfo:
-    """
-    Information about an import expression.
-    """
-
-    module_path: str
-    attr_name: str | None
-    alias_name: str
-
-
-@dataclass
-class TryImportInfo:
-    """
-    Represents information about a try-import block in the AST.
-
-    This dataclass is used to capture and organize the import statements that appear
-    within the different clauses of a try-except-else-finally block. Each field holds
-    a list of import statements (or related nodes) that are encountered in the corresponding
-    clause of the try block.
-
-    Attributes:
-        try_imports (list): Import statements found in the 'try' clause.
-        except_imports (list): Import statements found in any 'except' clauses.
-        else_imports (list): Import statements found in the 'else' clause, if present.
-        finally_imports (list): Import statements found in the 'finally' clause, if present.
-
-    This structure allows the preprocessor to track and process imports that are conditionally
-    executed depending on exception handling logic.
-    """
-
-    try_imports: "list[ImportInfo | TryImportInfo]"
-    except_imports: "list[ImportInfo | TryImportInfo]"
-    else_imports: "list[ImportInfo | TryImportInfo]"
-    finally_imports: "list[ImportInfo | TryImportInfo]"
 
 
 @dataclass
@@ -306,7 +288,6 @@ class SessionData:
 
     counter: int = 0  # Unique function names for multiple loops
     scope_manager: ScopeManager = field(default_factory=ScopeManager.create)
-    function_counter: int = 0
     function_name: str = "<unknown function>"
     class_name: str | None = None
     file_name: str = "<unknown filename>"
@@ -317,20 +298,20 @@ class SessionData:
     lambda_args: list[str] = field(default_factory=list)
 
     @contextlib.contextmanager
-    def set_current_class_name(self, class_name: str) -> Generator[None, None, None]:
-        old_class_name = self.class_name
-        self.class_name = class_name
-        yield
-        self.class_name = old_class_name
+    def _set_attr(self, attr: str, value: str) -> Generator[None, None, None]:
+        """Temporarily set ``self.<attr>`` to ``value``, restoring it on exit."""
+        old_value = getattr(self, attr)
+        setattr(self, attr, value)
+        try:
+            yield
+        finally:
+            setattr(self, attr, old_value)
 
-    @contextlib.contextmanager
-    def set_current_function_name(
-        self, function_name: str
-    ) -> Generator[None, None, None]:
-        old_function_name = self.function_name
-        self.function_name = function_name
-        yield
-        self.function_name = old_function_name
+    def set_current_class_name(self, class_name: str) -> Any:
+        return self._set_attr("class_name", class_name)
+
+    def set_current_function_name(self, function_name: str) -> Any:
+        return self._set_attr("function_name", function_name)
 
 
 def _create_module_attribute(
@@ -382,6 +363,13 @@ def _create_module_attribute(
     return result
 
 
+def _mark_synth_scope(func_def: ast.FunctionDef) -> ast.FunctionDef:
+    """SYNTHESIZED-scope fact: this def is a rewrite-created arm/body block,
+    not a source scope; the call-boundary pass keys frame reflection on it."""
+    func_def._pyir_synth_scope = True  # type: ignore[attr-defined]
+    return func_def
+
+
 _ComprehensionT = TypeVar(
     "_ComprehensionT", ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp
 )
@@ -400,6 +388,10 @@ class DSLPreprocessor(ast.NodeTransformer):
     DECORATOR_IF_STATEMENT = "if_selector"
     DECORATOR_WHILE_STATEMENT = "while_selector"
     IF_EXECUTOR = "if_executor"
+
+    # F-COVER: the base rewrite emits no PyIR choke set, so functions it
+    # rewrites carry no ``__pyir_rewritten__`` attestation stamp.
+    choke_set_version: "int | None" = None
     IFEXP_EXECUTOR = "ifExp_executor"
     WHILE_EXECUTOR = "while_executor"
     ASSERT_EXECUTOR = "assert_executor"
@@ -408,10 +400,6 @@ class DSLPreprocessor(ast.NodeTransformer):
     CONST_EXPR_NAME = {"const_expr", "target_version"}
     COMPARE_EXECUTOR = "compare_executor"
     BUILTIN_REDIRECTOR = "redirect_builtin_function"
-    IMPORT_EXCEPTION_LIST = {"ImportError", "ModuleNotFoundError", "Exception"}
-
-    def _has_pyir_support(self) -> bool:
-        return False
 
     def generic_visit(self, node: ast.AST) -> ast.AST:
         """
@@ -453,7 +441,6 @@ class DSLPreprocessor(ast.NodeTransformer):
         # Persistent state
         self.processed_functions: set[Callable[..., Any]] = set()
         self.client_module_name = client_module_name
-        self.module_cache: dict[ModuleType, list[ImportInfo | TryImportInfo]] = {}
         self._session_data: SessionData | None = None
 
     def _create_session_data(self) -> SessionData:
@@ -487,201 +474,6 @@ class DSLPreprocessor(ast.NodeTransformer):
         )
         return self._session_data
 
-    def _can_catch_import_error(self, handler: ast.ExceptHandler) -> bool:
-        """Return whether an except handler can catch import errors."""
-        handler_type = handler.type
-        if handler_type is None:
-            return True
-        if isinstance(handler_type, ast.Name):
-            return handler_type.id in self.IMPORT_EXCEPTION_LIST
-        if isinstance(handler_type, ast.Tuple):
-            return any(
-                isinstance(element, ast.Name)
-                and element.id in self.IMPORT_EXCEPTION_LIST
-                for element in handler_type.elts
-            )
-        return False
-
-    def _get_imports_from_ast(
-        self, node: ast.AST, module: ModuleType
-    ) -> list[ImportInfo | TryImportInfo]:
-        """
-        Recursively extracts all import statements from the given AST node.
-
-        This method traverses the AST of a Python module and collects information about all
-        import statements, including standard imports, from-imports (with support for relative imports),
-        and imports that appear within try/except/finally blocks. For try blocks, it also handles
-        imports that may be conditionally executed in except, else, or finally clauses, specifically
-        looking for handlers that catch ImportError, ModuleNotFoundError, or Exception.
-
-        Args:
-            node: The AST node (typically an ast.Module) to search for import statements.
-            module: The Python module object corresponding to the AST, used for resolving relative imports.
-
-        Returns:
-            A list of ImportInfo and TryImportInfo objects representing all discovered imports in the AST.
-        """
-        imports: list[ImportInfo | TryImportInfo] = []
-        alias: Callable[[ast.alias], str] = lambda n: n.asname if n.asname else n.name
-        for child_node in ast.iter_child_nodes(node):
-            if isinstance(child_node, ast.Import):
-                for name in child_node.names:
-                    imports.append(
-                        ImportInfo(
-                            module_path=name.name,
-                            attr_name=None,
-                            alias_name=alias(name),
-                        )
-                    )
-            elif isinstance(child_node, ast.ImportFrom):
-                module_name = child_node.module
-                if child_node.level > 0:
-                    # Handle relative imports.
-                    if module.__package__:
-                        package_name = module.__package__.rsplit(
-                            ".", child_node.level - 1
-                        )[0]
-                        # For `from . import x`, module name is None, just use package name
-                        if module_name:
-                            module_name = f"{package_name}.{module_name}"
-                        else:
-                            module_name = package_name
-                    else:
-                        # Handle typically some local import like:
-                        # from .common_dense_gemm import DenseGemmKernel
-                        # where there is no __package__, either None
-                        # when in __main__ or '' otherwise.
-                        module_name = f"{module_name}"
-                for name in child_node.names:
-                    imports.append(
-                        ImportInfo(
-                            module_path=module_name or "",
-                            attr_name=name.name,
-                            alias_name=alias(name),
-                        )
-                    )
-            # ast.TryStar is introduced in Python 3.11. Can't use directly in Python 3.10 and lower.
-            elif isinstance(child_node, (ast.Try, getattr(ast, "TryStar", ast.Try))):
-                # Handle try-catch
-                try_imports = self._get_imports_from_ast(
-                    ast.Module(body=child_node.body, type_ignores=[]),  # type: ignore[attr-defined]
-                    module,
-                )
-                # search handler for ImportError or ModuleNotFoundError
-                except_imports: list[ImportInfo | TryImportInfo] = []
-                for handler in child_node.handlers:  # type: ignore[attr-defined]
-                    if self._can_catch_import_error(handler):
-                        except_imports = self._get_imports_from_ast(
-                            ast.Module(body=handler.body, type_ignores=[]), module
-                        )
-                        break
-                else_imports = self._get_imports_from_ast(
-                    ast.Module(body=child_node.orelse, type_ignores=[]),  # type: ignore[attr-defined]
-                    module,
-                )
-                finally_imports = self._get_imports_from_ast(
-                    ast.Module(body=child_node.finalbody, type_ignores=[]),  # type: ignore[attr-defined]
-                    module,
-                )
-                imports.append(
-                    TryImportInfo(
-                        try_imports, except_imports, else_imports, finally_imports
-                    )
-                )
-        return imports
-
-    def _get_module_imports(
-        self, decorated_func: Callable[..., Any]
-    ) -> list[ImportInfo | TryImportInfo]:
-        """Extract imports from the module containing the decorated function"""
-        imports: list[ImportInfo | TryImportInfo] = []
-
-        # Get the module containing the decorated function
-        if module := inspect.getmodule(decorated_func):
-            if module in self.module_cache:
-                return self.module_cache[module]
-            try:
-                # Get the module source code
-                source = inspect.getsource(module)
-                module_ast = ast.parse(source)
-
-                imports = self._get_imports_from_ast(module_ast, module)
-                self.module_cache[module] = imports
-            except (IOError, TypeError):
-                pass
-
-        return imports
-
-    def try_import_first_and_then_local_import(self, module_path: str) -> ModuleType:
-        @contextlib.contextmanager
-        def local_import(module_path: str) -> Generator[ModuleType, None, None]:
-            # Directory where some local import might happen:
-            local_dir = os.path.dirname(self.session_data.file_name)
-            # Momentarily insert the directory where the local import
-            # used to happen, so the import can find the module.
-            sys.path.insert(0, local_dir)
-            try:
-                yield importlib.import_module(module_path)
-            finally:
-                # Clean up even in the case of an exception.
-                sys.path.pop(0)
-
-        try:
-            # Try the normal import first.
-            return importlib.import_module(module_path)
-        except (ImportError, AttributeError):
-            # If the normal import failed, tried a local import because we might
-            # have lost track of sys.path changes.
-            with local_import(module_path) as module:
-                return module
-
-    def exec_import(
-        self, import_info: ImportInfo, exec_globals: dict[str, Any]
-    ) -> None:
-        module_path, attr_name, alias_name = (
-            import_info.module_path,
-            import_info.attr_name,
-            import_info.alias_name,
-        )
-        module = self.try_import_first_and_then_local_import(module_path)
-        if attr_name:
-            if attr_name == "*":
-                if hasattr(module, "__all__"):
-                    attrs = module.__all__
-                else:
-                    attrs = [name for name in dir(module) if not name.startswith("_")]
-            else:
-                attrs = [attr_name]
-
-            for attr in attrs:
-                alias = attr if attr_name == "*" else alias_name
-                exec_globals[alias] = getattr(module, attr)
-        else:
-            exec_globals[alias_name] = module
-
-    def exec_imports(
-        self,
-        import_infos: list[ImportInfo | TryImportInfo],
-        exec_globals: dict[str, Any],
-    ) -> None:
-        for import_info in import_infos:
-            if isinstance(import_info, ImportInfo):
-                try:
-                    self.exec_import(import_info, exec_globals)
-                except (ImportError, AttributeError) as e:
-                    raise ImportError(
-                        f"Failed to import {import_info.module_path}: {str(e)}"
-                    )
-            elif isinstance(import_info, TryImportInfo):
-                try:
-                    self.exec_imports(import_info.try_imports, exec_globals)
-                except (ImportError, AttributeError):
-                    self.exec_imports(import_info.except_imports, exec_globals)
-                else:
-                    self.exec_imports(import_info.else_imports, exec_globals)
-                finally:
-                    self.exec_imports(import_info.finally_imports, exec_globals)
-
     def exec(
         self,
         function_name: str,
@@ -689,13 +481,6 @@ class DSLPreprocessor(ast.NodeTransformer):
         code_object: types.CodeType,
         exec_globals: dict[str, Any],
     ) -> Callable[..., Any] | None:
-        """Requires an active DSL preprocessor session."""
-        # Get imports from the original module
-        module_imports = self._get_module_imports(original_function)
-
-        # Import all required modules
-        self.exec_imports(module_imports, exec_globals)
-
         # Execute the transformed code
         log().info(
             "ASTPreprocessor Executing transformed code for function [%s]",
@@ -721,18 +506,36 @@ class DSLPreprocessor(ast.NodeTransformer):
             i += 1
         return f"{base_name}_{i}"
 
+    @staticmethod
+    def _default_arg_source_names(func_ast: ast.FunctionDef) -> dict[str, str]:
+        """Map parameters to source-level names used as their defaults."""
+        ast_defaults: dict[str, ast.expr] = {}
+        all_args = func_ast.args.posonlyargs + func_ast.args.args
+        offset = len(all_args) - len(func_ast.args.defaults)
+        for i, default_node in enumerate(func_ast.args.defaults):
+            ast_defaults[all_args[offset + i].arg] = default_node
+        for kwarg, kw_default in zip(
+            func_ast.args.kwonlyargs, func_ast.args.kw_defaults
+        ):
+            if kw_default is not None:
+                ast_defaults[kwarg.arg] = kw_default
+        return {
+            param_name: default_node.id
+            for param_name, default_node in ast_defaults.items()
+            if isinstance(default_node, ast.Name)
+        }
+
     def _inject_default_arg_values(
         self,
         function_pointer: Callable[..., Any],
-        func_ast: ast.FunctionDef,
+        source_names: dict[str, str],
     ) -> None:
         """Inject default-argument values whose source-level names are unresolvable.
 
         When a decorated function uses ``_param=name`` where ``name`` is a local
         in an enclosing factory, ``exec()`` needs ``name`` in its namespace.
         We use ``inspect.signature`` for runtime default values and the
-        already-parsed *func_ast* for the source-level name each default
-        references.
+        already-parsed source-name map for the name each default references.
         """
         exec_globals = self.session_data.function_globals
         if exec_globals is None:
@@ -745,22 +548,16 @@ class DSLPreprocessor(ast.NodeTransformer):
         }
         if not params_with_defaults:
             return
-        # Build map: parameter name → AST default node
-        # (covers both positional and keyword-only parameters)
-        ast_defaults: dict[str, ast.expr] = {}
-        all_args = func_ast.args.posonlyargs + func_ast.args.args
-        offset = len(all_args) - len(func_ast.args.defaults)
-        for i, default_node in enumerate(func_ast.args.defaults):
-            ast_defaults[all_args[offset + i].arg] = default_node
-        for kwarg, kw_default in zip(
-            func_ast.args.kwonlyargs, func_ast.args.kw_defaults
-        ):
-            if kw_default is not None:
-                ast_defaults[kwarg.arg] = kw_default
         for param_name, default_val in params_with_defaults.items():
-            ast_node = ast_defaults.get(param_name)
-            if isinstance(ast_node, ast.Name) and ast_node.id not in exec_globals:
-                exec_globals[ast_node.id] = default_val
+            source_name = source_names.get(param_name)
+            if source_name is not None and source_name not in exec_globals:
+                exec_globals[source_name] = default_val
+
+    def _post_visit_function_body(self, func_def: ast.FunctionDef) -> "list[ast.stmt]":
+        """Hook for a mode-specific post-pass over the fully instrumented
+        function body; returns preamble statements to bind right after the
+        module-alias imports.  The base rewrite has none."""
+        return []
 
     def transform_function(
         self, func_name: str, function_pointer: Callable[..., Any]
@@ -802,14 +599,13 @@ class DSLPreprocessor(ast.NodeTransformer):
                         _node.col_offset += _col_shift  # type: ignore[attr-defined]
                     if getattr(_node, "end_col_offset", None) is not None:
                         _node.end_col_offset += _col_shift  # type: ignore[attr-defined]
-        except Exception:
-            # Under REPL mode, there is no way to get source of a function object, error out
-            raise DSLRuntimeError(
-                f"Failed to parse function {func_name}",
-                suggestion="DSL does not support REPL mode, save the function to a file instead.",
-            )
+        except (OSError, TypeError) as e:
+            # No retrievable source (REPL / exec())
+            raise DSLUserCodeError(DiagId.UNSUP_NO_SOURCE, func=func_name, cause=e)
+        except Exception as e:
+            raise DSLRuntimeError(f"Failed to parse function {func_name}", cause=e)
 
-        # Step 1.2 Check the decorator
+        # Step 1.2 Check the decorator (legacy Python backend)
         if not self.check_decorator(tree.body[0]):
             log().info(
                 "[%s] - Skipping function due to missing decorator",
@@ -827,14 +623,23 @@ class DSLPreprocessor(ast.NodeTransformer):
         # names and inspect.signature to get runtime values.
         func_def = tree.body[0]
         assert isinstance(func_def, ast.FunctionDef)
-        self._inject_default_arg_values(function_pointer, func_def)
+        self._inject_default_arg_values(
+            function_pointer, self._default_arg_source_names(func_def)
+        )
 
         # Step 2. Transform the function
         transformed_tree = self.visit(tree)
 
+        # Step 2.5. Mode-specific post-pass over the instrumented tree (the
+        # body is fully visited at this point); any returned preamble
+        # statements bind after the module-alias imports below.
+        preamble_stmts: "list[ast.stmt]" = []
+        if isinstance(transformed_tree.body[0], ast.FunctionDef):
+            preamble_stmts = self._post_visit_function_body(transformed_tree.body[0])
+
         # Step 3. Import cutlass and base_dsl
         top_module_name = ".".join(self.client_module_name)
-        import_stmts = []
+        import_stmts: "list[ast.stmt]" = []
         if self.session_data.import_top_module:
             import_stmts.append(
                 ast.Import(
@@ -851,6 +656,7 @@ class DSLPreprocessor(ast.NodeTransformer):
 
         assert len(transformed_tree.body) == 1
         assert isinstance(transformed_tree.body[0], ast.FunctionDef)
+        import_stmts.extend(preamble_stmts)
         transformed_tree.body[0].body = import_stmts + transformed_tree.body[0].body
         # Remove all decorators from top level function
         transformed_tree.body[0].decorator_list = []
@@ -1035,9 +841,7 @@ class DSLPreprocessor(ast.NodeTransformer):
         )
         self.session_data.function_globals = None
         unified_tree = ast.Module(body=transformed_tree, type_ignores=[])
-        unified_tree = ast.fix_missing_locations(unified_tree)
-
-        return unified_tree
+        return ast.fix_missing_locations(unified_tree)
 
     def analyze_region_variables(
         self,
@@ -1046,16 +850,16 @@ class DSLPreprocessor(ast.NodeTransformer):
         active_callables: list[set[str]],
     ) -> tuple[list[str], int, list[str]]:
         """
-        Analyze variables in different code regions to identify read-only, write-only,
-        and active variables for DSL constructs.
-        """
+        Analyze loop-carried and closure variables in a control-flow region.
 
+        This is the reference implementation used by the Python backend. The
+        full native transformer performs the same analysis internally without
+        crossing back into Python for individual control-flow regions.
+        """
         # we need orderedset to keep the insertion order the same. otherwise generated IR is different each time
         write_args = OrderedSet()
         invoked_args = OrderedSet()
         called_functions = OrderedSet()
-
-        support_pyir = self._has_pyir_support()
 
         class RegionAnalyzer(ast.NodeVisitor):
             force_store = False
@@ -1101,16 +905,6 @@ class DSLPreprocessor(ast.NodeTransformer):
                     return None
                 return None
 
-            @staticmethod
-            def get_function_name(func_node: ast.Call) -> str | None:
-                if isinstance(func_node.func, ast.Name):
-                    function_name = func_node.func.id
-                elif isinstance(func_node.func, ast.Attribute):
-                    function_name = func_node.func.attr
-                else:
-                    function_name = None
-                return function_name
-
             def visit_Call(self, node: ast.Call) -> None:
                 base_name = RegionAnalyzer.get_call_base(node.func)
 
@@ -1120,12 +914,8 @@ class DSLPreprocessor(ast.NodeTransformer):
 
                 # Classes are mutable by default. Mark them as write. If they are
                 # dataclass(frozen=True), treat them as read in runtime.
-                if base_name is not None:
-                    if base_name == "self" and support_pyir:
-                        # pyir can handle self as a write argument
-                        pass
-                    else:
-                        invoked_args.add(base_name)
+                if base_name is not None and base_name not in ("self",):
+                    invoked_args.add(base_name)
 
                 self.generic_visit(node)
 
@@ -1144,9 +934,18 @@ class DSLPreprocessor(ast.NodeTransformer):
 
         write_args_list: list[str] = list(write_args.intersections(active_symbols))
         invoked_args_list: list[str] = list(invoked_args.intersections(active_symbols))
-        called_functions_list: list[str] = list(
-            called_functions.intersections(active_callables)
+        # The current function is tracked as callable so recursive references
+        # resolve inside its body, but it is not an enclosing closure. Checking
+        # the decorated runtime wrapper would inspect the decorator's captures
+        # instead of the user's function.
+        current_function_name = (
+            self._session_data.function_name if self._session_data is not None else None
         )
+        called_functions_list: list[str] = [
+            name
+            for name in called_functions.intersections(active_callables)
+            if name != current_function_name
+        ]
         return (
             write_args_list + invoked_args_list,
             len(write_args_list),
@@ -1182,8 +981,13 @@ class DSLPreprocessor(ast.NodeTransformer):
                 end_col_offset=getattr(iter_node, "end_col_offset", None),
             )
 
+    @staticmethod
+    def _keyword_map(iter_node: ast.Call) -> dict[str | None, ast.expr]:
+        """Map a call's keyword arguments by name to their value AST nodes."""
+        return {kw.arg: kw.value for kw in iter_node.keywords}
+
     def extract_unroll_args(self, iter_node: ast.Call) -> tuple[ast.expr, ast.expr]:
-        keywords = {kw.arg: kw.value for kw in iter_node.keywords}
+        keywords = self._keyword_map(iter_node)
         return (
             keywords.get("unroll", ast.Constant(value=-1)),
             keywords.get("unroll_full", ast.Constant(value=False)),
@@ -1199,7 +1003,7 @@ class DSLPreprocessor(ast.NodeTransformer):
         warnings.simplefilter("default", category)  # reset filter
 
     def extract_prefetch_stages_args(self, iter_node: ast.Call) -> ast.expr:
-        keywords = {kw.arg: kw.value for kw in iter_node.keywords}
+        keywords = self._keyword_map(iter_node)
         if "pipelining" in keywords:
             self.issue_deprecation_warning(
                 message="pipelining is deprecated, use prefetch_stages instead",
@@ -1211,12 +1015,25 @@ class DSLPreprocessor(ast.NodeTransformer):
         return keywords.get("prefetch_stages", ast.Constant(value=None))
 
     def extract_vectorize_args(self, iter_node: ast.Call) -> ast.expr:
-        keywords = {kw.arg: kw.value for kw in iter_node.keywords}
+        keywords = self._keyword_map(iter_node)
         return keywords.get("vectorize", ast.Constant(value=None))
 
     def extract_at_least_once_args(self, iter_node: ast.Call) -> ast.expr:
-        keywords = {kw.arg: kw.value for kw in iter_node.keywords}
+        keywords = self._keyword_map(iter_node)
         return keywords.get("at_least_once", ast.Constant(value=False))
+
+    def _visit_stmts_into(self, stmts: list[ast.stmt], out: list[ast.stmt]) -> None:
+        """Visit each statement and append its result to ``out``, flattening lists.
+
+        Shared inner loop for the control-flow body builders (loop / if-then /
+        if-else / while-after); call inside the appropriate Region/scope context.
+        """
+        for stmt in stmts:
+            transformed_stmt = self.visit(stmt)  # Recursively visit inner statements
+            if isinstance(transformed_stmt, list):
+                out.extend(transformed_stmt)
+            else:
+                out.append(transformed_stmt)
 
     def create_loop_function(
         self,
@@ -1251,14 +1068,7 @@ class DSLPreprocessor(ast.NodeTransformer):
         body_prep_stmts = self._prepare_loop_body_vars(node, write_args)
 
         with Region(self.session_data, new_value=transformed_body):
-            for stmt in node.body:
-                transformed_stmt = self.visit(
-                    stmt
-                )  # Recursively visit inner statements
-                if isinstance(transformed_stmt, list):
-                    transformed_body.extend(transformed_stmt)
-                else:
-                    transformed_body.append(transformed_stmt)
+            self._visit_stmts_into(node.body, transformed_body)
 
         if body_prep_stmts:
             transformed_body[:0] = body_prep_stmts
@@ -1312,17 +1122,19 @@ class DSLPreprocessor(ast.NodeTransformer):
         )
 
         return ast.copy_location(
-            ast.FunctionDef(
-                name=func_name,
-                args=ast.arguments(
-                    posonlyargs=[],
-                    args=func_args,
-                    kwonlyargs=[],
-                    kw_defaults=[],
-                    defaults=[],
-                ),
-                body=transformed_body,
-                decorator_list=[decorator],
+            _mark_synth_scope(
+                ast.FunctionDef(
+                    name=func_name,
+                    args=ast.arguments(
+                        posonlyargs=[],
+                        args=func_args,
+                        kwonlyargs=[],
+                        kw_defaults=[],
+                        defaults=[],
+                    ),
+                    body=transformed_body,
+                    decorator_list=[decorator],
+                )
             ),
             node,
         )
@@ -1474,7 +1286,7 @@ class DSLPreprocessor(ast.NodeTransformer):
                 func=_create_module_attribute(
                     "cf_symbol_check", lineno=func.lineno, col_offset=func.col_offset
                 ),
-                args=[deepcopy(func)],
+                args=[_deepcopy_ast_root(func)],
                 keywords=[],
             ),
             func,
@@ -1705,11 +1517,13 @@ class DSLPreprocessor(ast.NodeTransformer):
             )
         )
 
-    def _prepare_loop_induction_var(self, node: ast.For) -> None:
-        """Prepare loop induction variable before function creation.
-
-        Override for custom behavior (e.g., mark variable for special handling).
-        """
+    def _prepare_loop_induction_var(
+        self,
+        node: ast.For,
+        target_is_live_after_loop: bool = False,
+        loop_carried_var_name: str | None = None,
+    ) -> None:
+        """Prepare loop induction variable before function creation."""
         pass  # No preparation needed in base class
 
     def _cleanup_loop_induction_var(self, node: ast.For) -> None:
@@ -1772,6 +1586,11 @@ class DSLPreprocessor(ast.NodeTransformer):
 
         assert isinstance(node.iter, ast.Call)
         start_expr, stop_expr, step_expr, has_step = self.extract_range_args(node.iter)
+        # Template method: a derived class may instrument the bound expressions,
+        # consumed at loop-selector call time outside the visited body.
+        start_expr = self._prepare_loop_bound_expr(start_expr)
+        stop_expr = self._prepare_loop_bound_expr(stop_expr)
+        step_expr = self._prepare_loop_bound_expr(step_expr)
         unroll, unroll_full = self.extract_unroll_args(node.iter)
         prefetch_stages = self.extract_prefetch_stages_args(node.iter)
         vectorize = self.extract_vectorize_args(node.iter)
@@ -1812,8 +1631,15 @@ class DSLPreprocessor(ast.NodeTransformer):
         func_name = f"loop_body_{self.session_data.counter}"
         self.session_data.counter += 1
 
-        # Template method: prepare induction variable (e.g., mark for special handling)
-        self._prepare_loop_induction_var(node)
+        # Template method: prepare induction variable (e.g., mark for special
+        # handling); passes the live-out signal + synthetic carry name.
+        self._prepare_loop_induction_var(
+            node,
+            target_is_live_after_loop=target_var_is_active_before_loop,
+            loop_carried_var_name=(
+                loop_carried_var_name if target_var_is_active_before_loop else None
+            ),
+        )
 
         func_def = self.create_loop_function(
             func_name,
@@ -1968,8 +1794,15 @@ class DSLPreprocessor(ast.NodeTransformer):
         if isinstance(func, ast.Name):
             # AST rewrite only redirect call to bool to bool_cast
             # If `bool` escapes as a symbol, usually it means type check, do not rewrite it
-            if func.id == "bool":
-                return ast.copy_location(
+            # Any other call shape has no `bool_cast` spelling, so it is left as a
+            # plain `bool` call for Python itself to accept or reject
+            if (
+                func.id == "bool"
+                and len(node.args) == 1
+                and node.keywords == []
+                and not isinstance(node.args[0], ast.Starred)
+            ):
+                redirected = ast.copy_location(
                     ast.Call(
                         func=ast.Call(
                             func=_create_module_attribute(
@@ -1985,6 +1818,10 @@ class DSLPreprocessor(ast.NodeTransformer):
                     ),
                     node,
                 )
+                # Machinery application of the redirector's result: the outer
+                # call is not a user call, so the boundary pass skips it.
+                redirected._pyir_synth = True  # type: ignore[attr-defined]
+                return redirected
             elif func.id == "super" and node.args == [] and node.keywords == []:
                 # If it's a Python3 argument free super(), rewrite to old style super with args
                 # So if this call is under dynamic control flow, it still works.
@@ -2004,24 +1841,10 @@ class DSLPreprocessor(ast.NodeTransformer):
                     ),
                     node,
                 )
-            elif (
-                func.id in ("printf", "print_runtime")
-                and len(node.args) > 0
-                and isinstance(node.args[0], ast.JoinedStr)
-            ):
-                node.args = [
-                    ast.Starred(value=self.processFString(node), ctx=ast.Load())
-                ]
+            elif self._try_rewrite_printf_fstring(node, func.id):
                 already_rewritten = True
         elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            if (
-                func.attr in ("printf", "print_runtime")
-                and len(node.args) > 0
-                and isinstance(node.args[0], ast.JoinedStr)
-            ):
-                node.args = [
-                    ast.Starred(value=self.processFString(node), ctx=ast.Load())
-                ]
+            if self._try_rewrite_printf_fstring(node, func.attr):
                 already_rewritten = True
             else:
 
@@ -2091,19 +1914,7 @@ class DSLPreprocessor(ast.NodeTransformer):
         self.generic_visit(node)
         return node
 
-    def visit_Return(self, node: ast.Return) -> ast.stmt | list[ast.stmt]:
-        self.generic_visit(node)
-        return node
-
-    def visit_Expr(self, node: ast.Expr) -> ast.stmt | list[ast.stmt]:
-        self.generic_visit(node)
-        return node
-
-    def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
-        self.generic_visit(node)
-        return node
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> "ast.stmt | list[ast.stmt]":
         self._visit_target(node.target)
         self.generic_visit(node)
         return node
@@ -2141,12 +1952,9 @@ class DSLPreprocessor(ast.NodeTransformer):
         # "attributes" passes kernel function attributes (e.g. launch bounds)
         # to the compiler — its presence shouldn't prevent the preprocessor
         # from recognizing @cute.kernel(attributes=...) as a DSL decorator.
-        # "is_experimental" routes the function through the experimental
-        # CuTe DSL (see ``CuTeDSL.jit`` / ``CuTeDSL.kernel``).
         _known_dsl_kwargs = {
             "preprocess",
             "attributes",
-            "is_experimental",
         }
 
         for i, d in enumerate(decorator_list):
@@ -2268,7 +2076,9 @@ class DSLPreprocessor(ast.NodeTransformer):
         self.generic_visit(node)
         return node
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+    def visit_FunctionDef(
+        self, node: ast.FunctionDef
+    ) -> "ast.FunctionDef | list[ast.stmt]":
         # Add self to active symbols of parent scope
         self.session_data.scope_manager.add_to_callables(node.name)
 
@@ -2276,10 +2086,12 @@ class DSLPreprocessor(ast.NodeTransformer):
             self.session_data.scope_manager.enter_local_scope(),
             self.session_data.set_current_function_name(node.name),
         ):
-            self.session_data.function_counter += 1
+            # Keep recursive calls visible as callables without pretending the
+            # function name is an initialized body local. Python does not bind
+            # that local, so seeding the variable scope would turn a first
+            # same-spelling assignment into a read-before-write reassignment.
+            self.session_data.scope_manager.add_to_callables(node.name)
 
-            # Add function name and arguments
-            self.session_data.scope_manager.add_to_scope(node.name)
             for arg in node.args.args:
                 self.session_data.scope_manager.add_to_scope(arg.arg)
                 arg.annotation = None
@@ -2308,12 +2120,20 @@ class DSLPreprocessor(ast.NodeTransformer):
                 self.session_data.scope_manager.add_to_scope(item.optional_vars.id)
         return self.generic_visit(node)
 
+    def _handle_constexpr_test(self, node: ast.stmt) -> list[ast.stmt]:
+        """Insert a cf-symbol check before a const_expr if/while node.
+
+        Both nodes expose a ``.test`` that must be a Call; shared by
+        _handle_constexpr_if and _handle_constexpr_while.
+        """
+        self.generic_visit(node)
+        assert isinstance(node.test, ast.Call)  # type: ignore[attr-defined]
+        check = self._insert_cf_symbol_check(node.test.func)  # type: ignore[attr-defined]
+        return [check, node]
+
     def _handle_constexpr_while(self, node: ast.While) -> list[ast.stmt]:
         """Handle const_expr while statements. Override for custom behavior."""
-        self.generic_visit(node)
-        assert isinstance(node.test, ast.Call)
-        check = self._insert_cf_symbol_check(node.test.func)
-        return [check, node]
+        return self._handle_constexpr_test(node)
 
     def visit_While(self, node: ast.While) -> ast.While | list[ast.stmt]:
         # Constexpr doesn't get preprocessed
@@ -2532,7 +2352,7 @@ class DSLPreprocessor(ast.NodeTransformer):
 
         # Insert the block definitions into the most recent (innermost) region before the statement
         self.session_data.region_stack[-1].append_new_stmts(
-            [then_block_def, else_block_def]
+            [_mark_synth_scope(then_block_def), _mark_synth_scope(else_block_def)]
         )
 
         # Create the executor call node, wiring up the predicate and newly synthesized blocks
@@ -2625,12 +2445,7 @@ class DSLPreprocessor(ast.NodeTransformer):
             Region(self.session_data, new_value=result),
             self.session_data.scope_manager.enter_control_flow_scope(),
         ):
-            for stmt in stmts:
-                transformed_stmt = self.visit(stmt)
-                if isinstance(transformed_stmt, list):
-                    result.extend(transformed_stmt)
-                else:
-                    result.append(transformed_stmt)
+            self._visit_stmts_into(stmts, result)
             definitions = set(self.session_data.scope_manager.scopes[-1])
         return result, definitions
 
@@ -2680,12 +2495,16 @@ class DSLPreprocessor(ast.NodeTransformer):
         return exprs + [func_def] + assign
 
     def generate_get_locals_or_none_call(self, write_args: list[str]) -> ast.Call:
+        # The inner ``locals()`` is threading plumbing, not a user frame
+        # reflection: mark it so the call-boundary pass leaves it bare.
+        plumbing_locals = ast.Call(
+            func=ast.Name(id="locals", ctx=ast.Load()), args=[], keywords=[]
+        )
+        plumbing_locals._pyir_synth = True  # type: ignore[attr-defined]
         return ast.Call(
             func=_create_module_attribute("get_locals_or_none"),
             args=[
-                ast.Call(
-                    func=ast.Name(id="locals", ctx=ast.Load()), args=[], keywords=[]
-                ),
+                plumbing_locals,
                 ast.List(
                     elts=[ast.Constant(value=arg) for arg in write_args],
                     ctx=ast.Load(),
@@ -2721,14 +2540,7 @@ class DSLPreprocessor(ast.NodeTransformer):
             Region(self.session_data, new_value=then_body),
             self.session_data.scope_manager.enter_control_flow_scope(),
         ):
-            for stmt in node.body:
-                transformed_stmt = self.visit(
-                    stmt
-                )  # Recursively visit inner statements
-                if isinstance(transformed_stmt, list):
-                    then_body.extend(transformed_stmt)
-                else:
-                    then_body.append(transformed_stmt)
+            self._visit_stmts_into(node.body, then_body)
 
         # Create common return list for all blocks
         return_list = ast.List(
@@ -2755,11 +2567,13 @@ class DSLPreprocessor(ast.NodeTransformer):
 
         # Create then block
         then_block = ast.copy_location(
-            ast.FunctionDef(
-                name=then_block_name,
-                args=func_then_else_arguments,
-                body=then_body + [ast.Return(value=return_list)],
-                decorator_list=[],
+            _mark_synth_scope(
+                ast.FunctionDef(
+                    name=then_block_name,
+                    args=func_then_else_arguments,
+                    body=then_body + [ast.Return(value=return_list)],
+                    decorator_list=[],
+                )
             ),
             node,
         )
@@ -2842,12 +2656,20 @@ class DSLPreprocessor(ast.NodeTransformer):
                     #     else:
                     #         if pred:
                     # And under both cases, the `pred` can be a const_expr, so we need to handle it here.
+                    # Statements hoisted while visiting the elif test (walrus
+                    # lowering, read/effect anchors) must execute only when
+                    # every earlier arm's condition is false: collect them
+                    # into the synthesized else block, not the region
+                    # enclosing the whole if.
+                    elif_pre: list[ast.stmt] = []
                     if self.is_node_constexpr(elif_node):
-                        check = self._handle_constexpr_elif(elif_node)
+                        with Region(self.session_data, new_value=elif_pre):
+                            check = self._handle_constexpr_elif(elif_node)
                         else_block = ast.FunctionDef(
                             name=else_block_name,
                             args=func_then_else_arguments,
-                            body=[
+                            body=elif_pre
+                            + [
                                 check,
                                 elif_node,
                                 ast.Return(value=return_list),
@@ -2856,13 +2678,18 @@ class DSLPreprocessor(ast.NodeTransformer):
                         )
                     else:
                         # Recursion for nested elif
-                        nested_if = self.create_if_function(
-                            nested_if_name, elif_node, write_args, full_write_args_count
-                        )
+                        with Region(self.session_data, new_value=elif_pre):
+                            nested_if = self.create_if_function(
+                                nested_if_name,
+                                elif_node,
+                                write_args,
+                                full_write_args_count,
+                            )
                         else_block = ast.FunctionDef(
                             name=else_block_name,
                             args=func_then_else_arguments,
-                            body=[
+                            body=elif_pre
+                            + [
                                 nested_if,
                                 ast.Return(
                                     value=ast.Name(id=nested_if_name, ctx=ast.Load())
@@ -2876,14 +2703,7 @@ class DSLPreprocessor(ast.NodeTransformer):
                         Region(self.session_data, new_value=else_body),
                         self.session_data.scope_manager.enter_control_flow_scope(),
                     ):
-                        for stmt in node.orelse:
-                            transformed_stmt = self.visit(
-                                stmt
-                            )  # Recursively visit inner statements
-                            if isinstance(transformed_stmt, list):
-                                else_body.extend(transformed_stmt)
-                            else:
-                                else_body.append(transformed_stmt)
+                        self._visit_stmts_into(node.orelse, else_body)
 
                     # Regular else block
                     else_block = ast.FunctionDef(
@@ -2901,6 +2721,7 @@ class DSLPreprocessor(ast.NodeTransformer):
                     decorator_list=[],
                 )
 
+            _mark_synth_scope(else_block)
             # Add else_block to execute keywords
             execute_keywords.append(
                 ast.keyword(
@@ -2946,6 +2767,11 @@ class DSLPreprocessor(ast.NodeTransformer):
         Returns statements to insert at the beginning of while_before_block.
         """
         return []  # No preparation needed in base class
+
+    def _prepare_loop_bound_expr(self, expr: ast.expr) -> ast.expr:
+        """Instrument a staged-for range bound expression, evaluated at
+        loop-selector call time outside the visited body; base is identity."""
+        return expr
 
     def _prepare_loop_body_vars(
         self,
@@ -3060,11 +2886,13 @@ class DSLPreprocessor(ast.NodeTransformer):
         )
         while_before_stmts.append(ast.Return(value=while_before_return_list))
         while_before_block = ast.copy_location(
-            ast.FunctionDef(
-                name=while_before_block_name,
-                args=block_args,
-                body=while_before_stmts,
-                decorator_list=[],
+            _mark_synth_scope(
+                ast.FunctionDef(
+                    name=while_before_block_name,
+                    args=block_args,
+                    body=while_before_stmts,
+                    decorator_list=[],
+                )
             ),
             test_expr,
         )
@@ -3077,14 +2905,7 @@ class DSLPreprocessor(ast.NodeTransformer):
         # Section: while_after_block FunctionDef, which contains loop body
         while_after_stmts: list[ast.stmt] = []
         with Region(self.session_data, new_value=while_after_stmts):
-            for stmt in node.body:
-                transformed_stmt = self.visit(
-                    stmt
-                )  # Recursively visit inner statements
-                if isinstance(transformed_stmt, list):
-                    while_after_stmts.extend(transformed_stmt)
-                else:
-                    while_after_stmts.append(transformed_stmt)
+            self._visit_stmts_into(node.body, while_after_stmts)
 
         if body_prep_stmts:
             while_after_stmts[:0] = body_prep_stmts
@@ -3092,11 +2913,13 @@ class DSLPreprocessor(ast.NodeTransformer):
         while_after_stmts.append(ast.Return(value=yield_args_ast_name_list))
 
         while_after_block = ast.copy_location(
-            ast.FunctionDef(
-                name=while_after_block_name,
-                args=block_args,
-                body=while_after_stmts,
-                decorator_list=[],
+            _mark_synth_scope(
+                ast.FunctionDef(
+                    name=while_after_block_name,
+                    args=block_args,
+                    body=while_after_stmts,
+                    decorator_list=[],
+                )
             ),
             node,
         )

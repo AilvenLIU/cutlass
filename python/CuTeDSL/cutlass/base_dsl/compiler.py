@@ -22,6 +22,7 @@ import functools
 import importlib.util
 import os
 import re
+import shlex
 import sys
 import inspect
 import types
@@ -29,8 +30,75 @@ from .common import DSLBaseError, DSLUserCodeError
 from . import diagnostics as _diagnostics
 from .utils.logger import log
 from .env_manager import EnvironmentVarManager
-
 _SCRIPT_PATH = os.path.dirname(os.path.abspath(__file__))
+
+
+def _split_options(text: str) -> list:
+    """shlex.split an option string, keeping Windows path separators intact.
+
+    POSIX lexing treats "\\" as an escape, which silently turns an option like
+    ``--dump-dir=C:\\Temp\\x`` into ``--dump-dir=C:Tempx``. Doubling the
+    backslashes first makes them literal without disturbing any other quoting
+    rule.
+    """
+    if os.name == "nt":
+        text = text.replace("\\", "\\\\")
+    return shlex.split(text)
+
+
+# msvcrt's FILE is 48 bytes on x64 and stdout is __iob[1]; _IONBF is 4.
+_MSVCRT_FILE_SIZE = 48
+_IONBF = 4
+_jit_c_stdout_unbuffered = False
+
+
+def _unbuffer_jit_c_stdout() -> None:
+    """Unbuffer the C stdout that the JIT's ``printf`` writes to (Windows).
+
+    LLVM binds the JIT's ``printf`` by scanning the process's loaded modules
+    for an export of that name. The UCRT does not export one -- ``printf`` is
+    inline in its <stdio.h> -- so the search lands on the legacy
+    ``msvcrt.dll``, whose C stdout is a stream of its own, unrelated to the one
+    Python writes through. On a pipe it is fully buffered and flushed only when
+    msvcrt runs its exit handler, so every ``cute.printf`` line surfaces after
+    all Python output rather than interleaving in program order.
+
+    lit already pins the Python side with ``PYTHONUNBUFFERED=1``; this pins the
+    C side to match. Done once when the execution engine is built, so nothing
+    lands on the execution path, and it touches only msvcrt's stdout, which no
+    other part of the process writes to. No-op off Windows, where ``printf``
+    resolves to the same libc Python is already sharing.
+    """
+    global _jit_c_stdout_unbuffered
+    if _jit_c_stdout_unbuffered or os.name != "nt":
+        return
+    # Only ever attempt this once, successful or not.
+    _jit_c_stdout_unbuffered = True
+    import ctypes
+
+    try:
+        msvcrt = ctypes.CDLL("msvcrt.dll")
+        iob_func = getattr(msvcrt, "__iob_func")
+        iob_func.restype = ctypes.c_void_p
+        msvcrt._fileno.restype = ctypes.c_int
+        msvcrt._fileno.argtypes = [ctypes.c_void_p]
+        msvcrt.setvbuf.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_size_t,
+        ]
+        stdout = iob_func() + _MSVCRT_FILE_SIZE
+        # Confirm the FILE stride against the descriptor rather than trusting
+        # the struct layout blindly; leave the stream alone if it disagrees.
+        if msvcrt._fileno(stdout) != 1:
+            log().warning("msvcrt stdout not found at __iob[1]; leaving buffered")
+            return
+        msvcrt.setvbuf(stdout, None, _IONBF, 0)
+    except (OSError, AttributeError) as e:
+        log().warning(f"could not unbuffer the JIT's C stdout: {e}")
+
+
 sys.path.append(_SCRIPT_PATH)
 
 from .._mlir import ir
@@ -39,6 +107,16 @@ from .._mlir import ir
 # =============================================================================
 # Compiler Class
 # =============================================================================
+
+# Each entry is (marker, separator preceding the log, backend). Match ptxas
+# before libNVVM so a PTX-to-SASS failure is attributed to the correct stage.
+_BACKEND_FAILURE_MARKERS: tuple[tuple[str, str, str], ...] = (
+    # Normalized CudaToBinaryPass diagnostic.
+    ("PTXAS_ERROR", "ptxas log:", "ptxas"),
+    # The public chip-specific helper names its target in the diagnostic.
+    ("NVPTX compiler invocation failed for chip", ", error log:", "ptxas"),
+    ("NVVM_ERROR", "libNVVM extra log:", "nvvm"),
+)
 
 
 class CompilerDiagnosticError(DSLBaseError):
@@ -51,6 +129,7 @@ class CompilerDiagnosticError(DSLBaseError):
         *,
         backend: str = "",
         nvvm_error: str = "",
+        ptxas_error: str = "",
         ir_context: str = "",
         arch: str = "",
     ) -> None:
@@ -58,6 +137,7 @@ class CompilerDiagnosticError(DSLBaseError):
         self.raw_error = raw_error
         self.backend = backend
         self.nvvm_error = nvvm_error
+        self.ptxas_error = ptxas_error
         self.ir_context = ir_context
         self.arch = arch
         super().__init__(formatted)
@@ -69,6 +149,20 @@ class CompilerDiagnosticError(DSLBaseError):
         return self.formatted
 
 
+def _strip_mlir_continuation_indent(text: str) -> str:
+    """Remove MLIR's continuation indent from a multi-line diagnostic."""
+    continuation_indent = "  "
+    first, separator, rest = text.partition("\n")
+    if not separator:
+        return text
+    lines = rest.split("\n")
+    if not all(
+        line.startswith(continuation_indent) or not line.strip() for line in lines
+    ):
+        return text
+    return "\n".join([first, *(line[len(continuation_indent) :] for line in lines)])
+
+
 class Compiler:
     """Compiler class for compiling and building MLIR modules."""
 
@@ -77,21 +171,34 @@ class Compiler:
         self.execution_engine = execution_engine
         self._post_compile_hook: collections.abc.Callable[[Any], None] | None = None
 
-    def _process_error(self, error_msg: str) -> tuple[str | None, str | None, str]:
-        """Process error message to extract NVVM error and IR context"""
-        nvvm_error = None
-        ir_msg = ""
+    def _process_error(self, error_msg: str) -> tuple[str, str, str, str]:
+        """Split a backend failure into (compiler log, IR context, location, backend).
+
+        The backend is "" when `error_msg` is not a backend failure at all.
+        """
         location = _diagnostics.extract_compiler_location(error_msg)
 
-        if "NVVM_ERROR" in error_msg:
-            # Extract the specific NVVM error
-            nvvm_error = (
-                error_msg.split("libNVVM extra log:")[1].strip()
-                if "libNVVM extra log:" in error_msg
-                else error_msg
-            )
+        for marker, separator, backend in _BACKEND_FAILURE_MARKERS:
+            if marker not in error_msg:
+                continue
+
+            # maxsplit=1: the compiler log can contain the separator itself (a
+            # libNVVM failure whose text already quotes its own log, say), and
+            # splitting on every occurrence would keep only the part before the
+            # second one and drop the log we are trying to surface.
+            if separator in error_msg:
+                backend_error = error_msg.split(separator, 1)[1].strip()
+            else:
+                # Marker-only C++ patterns carry no dedicated log separator.
+                # Keep the payload after the marker without the surrounding
+                # MLIR diagnostic prefix (for example, "error: unknown:").
+                backend_error = error_msg.split(marker, 1)[1].lstrip(" ,:").strip()
+                if not backend_error:
+                    backend_error = marker
+            backend_error = _strip_mlir_continuation_indent(backend_error)
 
             # Extract IR context
+            ir_msg = ""
             if "see current operation:" in error_msg:
                 # Get the IR section
                 ir_section = error_msg.split("see current operation:")[1].strip()
@@ -107,19 +214,22 @@ class Compiler:
                 else:
                     ir_msg = ir_section
 
-        return nvvm_error, ir_msg, location
+            return backend_error, ir_msg, location, backend
+
+        return "", "", location, ""
 
     def compile(
         self,
         module: ir.Module,
         pipeline: str,
         arch: str = "",
+        enable_debug_info: bool = False,
+        enable_verifier: bool = False,
+        *,
         remark_filter: str = "",
         warnings_filter: str = "",
         remark_output: str = "",
         collect_compiler_diagnostics: bool = False,
-        enable_debug_info: bool = False,
-        enable_verifier: bool = False,
     ) -> ir.Module:
         """Compiles the module by invoking the pipeline and returns it.
 
@@ -137,7 +247,7 @@ class Compiler:
             pm = self.passmanager.PassManager.parse(pipeline)
             pm.enable_verifier(enable_verifier)
 
-            # Enable remark streaming if configured
+            # Enable diagnostic collection or remark streaming when configured.
             diagnostic_session.enable()
 
             with diagnostic_session.collecting():
@@ -151,13 +261,31 @@ class Compiler:
                 if formatted:
                     raise CompilerDiagnosticError(formatted, raw_error=str(e)) from e
             error_msg = str(e)
-            nvvm_error, ir_msg, location = self._process_error(error_msg)
+            backend_error = ir_msg = location = backend = ""
+            # When warnings/remarks are enabled, the scoped MLIR diagnostic
+            # collector consumes regular error diagnostics. MLIRError then only
+            # contains the generic pass-failure text, so also inspect the
+            # collected messages for a backend marker and its original log.
+            error_candidates = (
+                error_msg,
+                *diagnostic_session._collected_error_texts(),
+            )
+            for candidate in error_candidates:
+                processed = self._process_error(candidate)
+                if processed[3]:
+                    backend_error, ir_msg, location, backend = processed
+                    error_msg = candidate
+                    break
 
-            if nvvm_error:
+            if backend_error:
                 ir_context = ir_msg or ""
+                is_ptxas = backend == "ptxas"
+                nvvm_error = "" if is_ptxas else backend_error
+                ptxas_error = backend_error if is_ptxas else ""
                 formatted = diagnostic_session.format_backend_failure(
                     raw_error=error_msg,
                     nvvm_error=nvvm_error,
+                    ptxas_error=ptxas_error,
                     ir_context=ir_context,
                     arch=arch,
                     location=location,
@@ -165,8 +293,9 @@ class Compiler:
                 raise CompilerDiagnosticError(
                     formatted,
                     raw_error=error_msg,
-                    backend="nvvm",
+                    backend=backend,
                     nvvm_error=nvvm_error,
+                    ptxas_error=ptxas_error,
                     ir_context=ir_context,
                     arch=arch,
                 ) from e
@@ -177,7 +306,6 @@ class Compiler:
         finally:
             # Finalize remark output after passes complete
             diagnostic_session.finalize()
-            pass
 
         if self._post_compile_hook:
             self._post_compile_hook(module)
@@ -190,6 +318,7 @@ class Compiler:
         shared_libs: collections.abc.Sequence[str] = (),
     ) -> Any:
         """Wraps the module in a JIT execution engine."""
+        _unbuffer_jit_c_stdout()
         return self.execution_engine.ExecutionEngine(
             module, opt_level=opt_level, shared_libs=shared_libs
         )
@@ -202,12 +331,13 @@ class Compiler:
         opt_level: int = 2,
         arch: str = "",
         enable_debug_info: bool = False,
+        enable_verifier: bool = False,
+        return_module: bool = False,
+        *,
         remark_filter: str = "",
         warnings_filter: str = "",
         remark_output: str = "",
         collect_compiler_diagnostics: bool = False,
-        enable_verifier: bool = False,
-        return_module: bool = False,
     ) -> Any:
         """Compiles and jits the module."""
         compiled_module = self.compile(
@@ -335,8 +465,8 @@ class StringCompileOption(CompileOption):
 
     def serialize(self) -> str:
         if self._value and self.__class__._option_name:
-            self._value = self._value.strip("'")
-            return f"{self.__class__._option_name}='{self._value}'"
+            value = self._value.strip("'")
+            return f"{self.__class__._option_name}='{value}'"
         return ""
 
 
@@ -424,6 +554,21 @@ class FrontendNext(BooleanCompileOption):
     """
 
 
+@register_option
+class DisableCuteExtCompile(BooleanCompileOption):
+    """Disable CuTe extension compilation for this compile invocation.
+
+    This option skips the CuTe extension compiler even when extension
+    compilation is enabled globally. Use it only when the program does not
+    require CuTe extension compiler support::
+
+        compiled = cute.compile[cute.DisableCuteExtCompile](fn, *args)
+
+    Operations that require CuTe extension compiler support are unsupported
+    when this option is selected and may fail during tracing or lowering.
+    """
+
+
 
 @register_option
 class ExtraCompilerOpts(CompileOption):
@@ -466,13 +611,11 @@ class ExtraCompilerOpts(CompileOption):
 
 
 def _ensure_ptxas_verbose(options: str) -> str:
-    import shlex
-
     stripped = (options or "").strip()
     if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in "'\"":
         stripped = stripped[1:-1]
     try:
-        tokens = shlex.split(stripped) if stripped else []
+        tokens = _split_options(stripped) if stripped else []
     except ValueError:
         tokens = stripped.split()
     if any(token in ("-v", "--verbose") for token in tokens):
@@ -585,6 +728,17 @@ class GPUArch(StringCompileOption):
             self._value = Arch.from_string(value).to_string()
 
 
+@register_option
+class FlattenLocsOutputJsonPath(StringCompileOption):
+    """Path to the FlattenLocs JSON sidecar (vloc id -> original source chain).
+
+    When set, the `flatten-locs` pass runs and writes the sidecar. Empty (the
+    default) makes the pass a no-op — the original loc chain passes through
+    to the LLVM backend unchanged.
+    """
+
+    _option_name = "flatten-locs-output-json-path"
+
 
 @register_option
 class LinkLibraries(StringCompileOption):
@@ -629,6 +783,13 @@ class HostTarget(StringCompileOption):
     Presets::
 
         linux-aarch64   → aarch64-unknown-linux-gnu
+        qnx8-aarch64    → aarch64-unknown-nto-qnx8.0.0
+
+    LLVM has no QNX target, so the QNX triple resolves to an unknown OS
+    and generic AArch64 ELF codegen: the emitted object is byte-identical
+    to the ``linux-aarch64`` one, and QNX uses the same AAPCS64 ABI. The
+    distinct triple exists so the AOT runtime library lookup
+    (``aot_config --target``) can tell the two targets apart.
 
     Long form (explicit tuning / escape hatch)::
 
@@ -650,6 +811,7 @@ class HostTarget(StringCompileOption):
 
     _PRESETS: "dict[str, tuple[str, str, str]]" = {
         "linux-aarch64": ("aarch64-unknown-linux-gnu", "", ""),
+        "qnx8-aarch64": ("aarch64-unknown-nto-qnx8.0.0", "", ""),
     }
 
     def __init__(self, val: str = "") -> None:
@@ -673,9 +835,7 @@ class HostTarget(StringCompileOption):
         if not spec:
             return "", "", ""
         if spec.startswith("llvm"):
-            import shlex as _shlex
-
-            tokens = _shlex.split(spec)
+            tokens = _split_options(spec)
             if not tokens or tokens[0] != "llvm":
                 raise ValueError(f"invalid host-target long form: {spec!r}")
             triple, cpu, features = "", "", ""
@@ -749,9 +909,9 @@ class RemarkFilter(StringCompileOption):
 
 @register_option
 class WarningsFilter(StringCompileOption):
-    """Checker domains whose WARNINGS the DSL displays, e.g. 'nvvm' or 'nvvm,ptx'.
+    """Checker domains whose warnings the DSL displays, for example ``nvvm``.
 
-    Set by the user-facing ``--warnings{<cat>}`` compile option. Errors are
+    Set by the user-facing ``warnings{<cat>}`` compile option. Errors are
     always shown; warnings are shown only for domains listed here. Not
     serialized into the pipeline string; consumed by the Python diagnostic
     renderer to gate warning visibility."""
@@ -770,7 +930,7 @@ class RemarkOutput(StringCompileOption):
 @register_option
 class CollectCompilerDiagnostics(BooleanCompileOption):
     """Track whether the C++ diagnostic-collection passes are enabled; set by
-    the ``--warnings`` / ``--remarks`` handlers, never itself serialized."""
+    the ``warnings`` / ``remarks`` handlers, never itself serialized."""
 
 
 class CompileOptions:
@@ -807,6 +967,101 @@ class CompileOptions:
         else:
             _validate_and_update_option(options)
 
+    def _parse_debug_token(
+        self, name: str, sub_str: "str | None", val_str: "str | None"
+    ) -> None:
+        """Handle the ``debug{...}`` compact token: validate selectors and record them."""
+        if val_str is not None or sub_str is None:
+            raise ValueError("debug expects selector braces, e.g. debug{launch-check}")
+        valid_selectors = {"launch-check"}
+        selectors = {item.strip() for item in sub_str.split(",") if item.strip()}
+        unknown = selectors - valid_selectors
+        if unknown:
+            valid_list = ", ".join(sorted(valid_selectors))
+            unknown_list = ", ".join(sorted(unknown))
+            raise ValueError(
+                f"debug supports selectors {{{valid_list}}}; "
+                f"unknown selector(s): {unknown_list}"
+            )
+        self._debug_selectors.update(selectors)
+
+    def _parse_diagnostic_token(
+        self,
+        name: str,
+        sub_str: "str | None",
+        val_str: "str | None",
+        raw_opts: "list[str]",
+    ) -> None:
+        """Handle the ``warnings{...}`` / ``remarks{...}`` compact tokens."""
+        if val_str is not None:
+            raise ValueError(f"{name} expects selector braces, e.g. {name}{{nvvm}}")
+        valid_selectors = {
+            "nvvm",
+            "ptx",
+        }
+        selectors = (
+            set(valid_selectors)
+            if sub_str is None
+            else {item.strip() for item in sub_str.split(",") if item.strip()}
+        )
+        unknown = selectors - valid_selectors
+        if unknown:
+            valid_list = ", ".join(sorted(valid_selectors))
+            unknown_list = ", ".join(sorted(unknown))
+            raise ValueError(
+                f"{name} supports selectors {{{valid_list}}}; "
+                f"unknown selector(s): {unknown_list}"
+            )
+        # warnings{} / remarks{} enable the C++ collection passes via
+        # the pipeline's `diagnostic=` selector. Errors are always-on
+        # regardless; these flags only control which severity the DSL
+        # displays (warnings vs remarks).
+        raw_opts.append(f"diagnostic={','.join(sorted(selectors))}")
+        self.options[CollectCompilerDiagnostics].value = True
+        self._ptxas_diagnostics_enabled = (
+            self._ptxas_diagnostics_enabled or "ptx" in selectors
+        )
+        if name == "warnings":
+            wf = self.options[WarningsFilter]
+            have = {d for d in wf.value.split(",") if d}
+            wf.value = ",".join(sorted(have | selectors))
+        else:  # remarks
+            _domain_to_remark_cat = {"nvvm": "Synchronization", "ptx": "ptxas"}
+            new_cats = {
+                _domain_to_remark_cat[s]
+                for s in selectors
+                if s in _domain_to_remark_cat
+            }
+            rf = self.options[RemarkFilter]
+            have = {c for c in rf.value.split("|") if c}
+            rf.value = "|".join(sorted(have | new_cats))
+
+    def _parse_named_option_token(
+        self,
+        name: str,
+        val_str: "str | None",
+        opt_name_map: dict,
+        raw_opts: "list[str]",
+    ) -> None:
+        """Handle the ``name`` / ``name=val`` form: enable/configure a named option."""
+        key = name
+        val = val_str or ""
+        if key in opt_name_map:
+            opt = self.options[opt_name_map[key]]
+            if isinstance(opt, BooleanCompileOption):
+                opt.value = (
+                    True if not val else val.lower() in ("1", "true", "yes", "on")
+                )
+            else:
+                if not val:
+                    raise DSLUserCodeError(
+                        _diagnostics.DiagId.CONFIG_OPTION_REQUIRES_VALUE,
+                        key=key,
+                    )
+                opt.value = val
+        else:
+            raw_opts.append(f"{key}={'true' if not val else val}")
+
     def _apply_opt_string(self, opt_str: str) -> None:
         """Apply a compact compiler option string in-place.
 
@@ -815,15 +1070,15 @@ class CompileOptions:
         ``--`` prefix optional)::
 
             # Errors are always shown and fail compilation -- no flag needed.
-            # --warnings / --remarks are opt-in and non-fatal; a {<cat>}
+            # warnings / remarks are opt-in and non-fatal; a {<cat>}
             # selector shows only that category, bare shows all categories.
-            --warnings                       # show all warnings
-            --warnings{nvvm}                 # show only nvvm-category warnings
-            --remarks                        # show all remarks
-            --remarks{nvvm}                  # show only nvvm (sync) remarks
-            --debug{launch-check}            # check CUDA launch arguments
-            --remarks{ptx}                   # show only ptxas remarks (spills...)
-            --iket                           # enable IKET (In-Kernel Event Tracing) instrumentation
+            warnings                         # show all warnings
+            warnings{nvvm}                   # show only nvvm-category warnings
+            remarks                          # show all remarks
+            remarks{nvvm}                    # show only nvvm (sync) remarks
+            remarks{ptx}                     # show only ptxas remarks (spills...)
+            debug{launch-check}              # check CUDA launch arguments
+            iket                             # enable IKET (In-Kernel Event Tracing) instrumentation
 
         :param opt_str: Compact option string to parse.
         :raises ValueError: On malformed syntax:
@@ -882,98 +1137,42 @@ class CompileOptions:
                 )
 
             if name == "debug":
-                if val_str is not None or sub_str is None:
-                    raise ValueError(
-                        "debug expects selector braces, e.g. debug{launch-check}"
-                    )
-                valid_selectors = {"launch-check"}
-                selectors = {
-                    item.strip() for item in sub_str.split(",") if item.strip()
-                }
-                unknown = selectors - valid_selectors
-                if unknown:
-                    valid_list = ", ".join(sorted(valid_selectors))
-                    unknown_list = ", ".join(sorted(unknown))
-                    raise ValueError(
-                        f"debug supports selectors {{{valid_list}}}; "
-                        f"unknown selector(s): {unknown_list}"
-                    )
-                self._debug_selectors.update(selectors)
+                self._parse_debug_token(name, sub_str, val_str)
             elif name in ("warnings", "remarks"):
-                if val_str is not None:
-                    raise ValueError(
-                        f"{name} expects selector braces, e.g. {name}{{nvvm}}"
-                    )
-                valid_selectors = {
-                    "nvvm",
-                    "ptx",
-                }
-                selectors = (
-                    set(valid_selectors)
-                    if sub_str is None
-                    else {item.strip() for item in sub_str.split(",") if item.strip()}
-                )
-                unknown = selectors - valid_selectors
-                if unknown:
-                    valid_list = ", ".join(sorted(valid_selectors))
-                    unknown_list = ", ".join(sorted(unknown))
-                    raise ValueError(
-                        f"{name} supports selectors {{{valid_list}}}; "
-                        f"unknown selector(s): {unknown_list}"
-                    )
-                # --warnings{} / --remarks{} enable the C++ collection passes via
-                # the internal `diagnostic=` selector. Errors are always-on
-                # regardless; these flags only control which severity the DSL
-                # displays (warnings vs remarks).
-                raw_opts.append(f"diagnostic={','.join(sorted(selectors))}")
-                self.options[CollectCompilerDiagnostics].value = True
-                self._ptxas_diagnostics_enabled = (
-                    self._ptxas_diagnostics_enabled or "ptx" in selectors
-                )
-                if name == "warnings":
-                    wf = self.options[WarningsFilter]
-                    have = {d for d in wf.value.split(",") if d}
-                    wf.value = ",".join(sorted(have | selectors))
-                else:  # remarks
-                    _domain_to_remark_cat = {"nvvm": "Synchronization", "ptx": "ptxas"}
-                    new_cats = {
-                        _domain_to_remark_cat[s]
-                        for s in selectors
-                        if s in _domain_to_remark_cat
-                    }
-                    rf = self.options[RemarkFilter]
-                    have = {c for c in rf.value.split("|") if c}
-                    rf.value = "|".join(sorted(have | new_cats))
+                self._parse_diagnostic_token(name, sub_str, val_str, raw_opts)
             elif name in ExtraCompilerOpts.COMPACT_FLAGS:
                 raw_opts.extend(ExtraCompilerOpts.expand(name, sub_str))
             elif sub_str is not None:
                 raise ValueError(f"option '{name}' does not take {{...}} sub-options")
             else:
-                # Form: name  or  name=val — enable/configure a named option.
-                key = name
-                val = val_str or ""
-                if key in opt_name_map:
-                    opt = self.options[opt_name_map[key]]
-                    if isinstance(opt, BooleanCompileOption):
-                        opt.value = (
-                            True
-                            if not val
-                            else val.lower() in ("1", "true", "yes", "on")
-                        )
-                    else:
-                        if not val:
-                            raise DSLUserCodeError(
-                                _diagnostics.DiagId.CONFIG_OPTION_REQUIRES_VALUE,
-                                key=key,
-                            )
-                        opt.value = val
-                else:
-                    raw_opts.append(f"{key}={'true' if not val else val}")
+                self._parse_named_option_token(name, val_str, opt_name_map, raw_opts)
 
         if raw_opts:
             existing = self.options[ExtraCompilerOpts].value
             combined = (existing + " " + " ".join(raw_opts)).strip()
             self.options[ExtraCompilerOpts].value = combined
+
+    @staticmethod
+    def _set_artifact_dump_paths(
+        option: Any,
+        dump_dir: str,
+        function_name: str,
+        arch: Any,
+        ext: str,
+        full_attr: str,
+    ) -> None:
+        """Set an artifact option's ``dump_path`` and its ``full_<ext>_path``.
+
+        ``dump_path`` is ``<dump_dir>/<function_name>`` and the full path is
+        ``<dump_dir>/<function_name>.<arch>.<ext>``. Shared by the PTX/CUBIN dump
+        blocks (identical shape, differing only in extension / attribute name).
+        """
+        option.dump_path = os.path.join(dump_dir, f"{function_name}")
+        setattr(
+            option,
+            full_attr,
+            os.path.join(dump_dir, f"{function_name}.{arch}.{ext}"),
+        )
 
     def apply_envar_settings(
         self, envar: EnvironmentVarManager, function_name: str
@@ -1015,20 +1214,13 @@ class CompileOptions:
         assert isinstance(keep_cubin, KeepCUBIN)
         if keep_ptx.value:
             assert dump_dir is not None
-            keep_ptx.dump_path = os.path.join(dump_dir, f"{function_name}")
-            keep_ptx.full_ptx_path = os.path.join(
-                dump_dir,
-                f"{function_name}.{arch}.ptx",
+            self._set_artifact_dump_paths(
+                keep_ptx, dump_dir, function_name, arch, "ptx", "full_ptx_path"
             )
         if keep_cubin.value:
             assert dump_dir is not None
-            keep_cubin.dump_path = os.path.join(
-                dump_dir,
-                f"{function_name}",
-            )
-            keep_cubin.full_cubin_path = os.path.join(
-                dump_dir,
-                f"{function_name}.{arch}.cubin",
+            self._set_artifact_dump_paths(
+                keep_cubin, dump_dir, function_name, arch, "cubin", "full_cubin_path"
             )
         keep_sass = self.options[KeepSASS]
         assert isinstance(keep_sass, KeepSASS)
@@ -1041,19 +1233,14 @@ class CompileOptions:
             _need_cubin_on_disk = True
             if _need_cubin_on_disk and not keep_cubin.value:
                 keep_cubin.value = True
-                keep_cubin.dump_path = os.path.join(dump_dir, f"{function_name}")
-                keep_cubin.full_cubin_path = os.path.join(
+                self._set_artifact_dump_paths(
+                    keep_cubin,
                     dump_dir,
-                    f"{function_name}.{arch}.cubin",
+                    function_name,
+                    arch,
+                    "cubin",
+                    "full_cubin_path",
                 )
-        if envar.remarks and not self.options[RemarkFilter].value:
-            self.options[RemarkFilter].value = envar.remarks
-        if envar.remarks and not self.options[RemarkOutput].value:
-            assert dump_dir is not None
-            self.options[RemarkOutput].value = os.path.join(
-                dump_dir,
-                f"{function_name}_remarks.yaml",
-            )
         raw_filter = self.options[RemarkFilter].value
         matches_ptxas = False
         if raw_filter:
@@ -1125,7 +1312,7 @@ class CompileOptions:
     @property
     def warnings_filter(self) -> str:
         """Comma-separated checker domains whose warnings the DSL shows
-        (set by --warnings{<cat>}). Empty means no warnings are displayed."""
+        (set by warnings{<cat>}). Empty means no warnings are displayed."""
         return self.options[WarningsFilter].value or ""
 
     @property
@@ -1138,8 +1325,8 @@ class CompileOptions:
 
     @property
     def collect_compiler_diagnostics(self) -> bool:
-        # Collection (and the nvvm checker) is enabled by --warnings{} /
-        # --remarks{}. When set, the checker runs and renders its diagnostics;
+        # Collection (and the nvvm checker) is enabled by warnings{} /
+        # remarks{}. When set, the checker runs and renders its diagnostics;
         # errors among them are always fatal + shown (no separate error flag).
         return bool(self.options[CollectCompilerDiagnostics].value)
 
@@ -1160,12 +1347,12 @@ class CompileOptions:
         which will be used in pipeline options.
         """
         self._finalize_derived_options()
-        flattend_options = ""
+        flattened_options = ""
         for option in self.options.values():
-            flattend_options += option.serialize() + " "
+            flattened_options += option.serialize() + " "
 
-        log().info("`cute.compile` CompileOptions: options=" + flattend_options)
-        return flattend_options
+        log().info("`cute.compile` CompileOptions: options=" + flattened_options)
+        return flattened_options
 
     def _finalize_derived_options(self) -> None:
         if not self._ptxas_diagnostics_enabled:
@@ -1225,8 +1412,6 @@ def _extract_compact_options(
         When the input is *pure* compact, the fully-configured CompileOptions
         is returned and the legacy string is empty.
     """
-    import shlex
-
     _COMPACT_NAMES: frozenset[str] = frozenset(
         {"warnings", "remarks"}
         | set(ExtraCompilerOpts.COMPACT_FLAGS)
@@ -1244,7 +1429,7 @@ def _extract_compact_options(
         return None, options
 
     try:
-        all_tokens = shlex.split(stripped)
+        all_tokens = _split_options(stripped)
     except ValueError as exc:
         raise ValueError(
             f"Failed to parse compiler options string: {exc}\n"
@@ -1284,8 +1469,6 @@ def _extract_compact_options(
 # To be removed in the future.
 def _parse_compile_options_from_str(options: str) -> CompileOptions:
     """Parse the compile options from a string."""
-    import shlex as _shlex
-
     _base_compile_options: "CompileOptions | None" = None
     _base_compile_options, options = _extract_compact_options(options)
     if isinstance(_base_compile_options, CompileOptions) and not options:
@@ -1297,7 +1480,7 @@ def _parse_compile_options_from_str(options: str) -> CompileOptions:
     )
     try:
         # Use shlex to properly handle options with spaces
-        parsed_options = _shlex.split(options) if options else []
+        parsed_options = _split_options(options) if options else []
         # Avoid parsing the ptxas-options value as a hyphen key
         for i in range(1, len(parsed_options)):
             if parsed_options[i - 1] in ["--ptxas-options"]:
@@ -1484,6 +1667,13 @@ class CompileCallable:
         if not hasattr(func, "_dsl_object"):
             raise DSLUserCodeError(_diagnostics.DiagId.CALL_MISSING_JIT_DECORATOR)
 
+        # Reject a @cute.kernel target.
+        if getattr(func, "_decorator_kind", "jit") == "kernel":
+            raise DSLUserCodeError(
+                _diagnostics.DiagId.CALL_KERNEL_TARGET,
+                function_name=getattr(func, "__name__", "<kernel>"),
+            )
+
         # Validate the migration-aid ``is_experimental`` kwarg against
         # the routing already baked into the function by its jit/kernel
         # decorator. This is *not* a behavior switch: both
@@ -1507,13 +1697,13 @@ class CompileCallable:
         if options is not None and isinstance(options, str):
             compile_options = _parse_compile_options_from_str(options)
             # A string ``options=...`` builds a fresh CompileOptions, which would
-            # otherwise drop the FrontendNext selector chosen via
-            # ``cute.compile[FrontendNext](...)`` (it carries no pipeline token).
-            # Re-apply just that selector so the staged frontend still composes
-            # with the option string. Other bracket options (e.g. DeviceTarget)
-            # intentionally keep the existing string-options behavior.
-            if self._compile_options.options[FrontendNext].value:
-                compile_options.options[FrontendNext].value = True
+            # otherwise drop non-pipeline selectors chosen through
+            # ``cute.compile[...]``. Re-apply them so they compose with the
+            # option string. Other bracket options intentionally keep the
+            # existing string-options behavior.
+            for selector in (FrontendNext, DisableCuteExtCompile):
+                if self._compile_options.options[selector].value:
+                    compile_options.options[selector].value = True
         else:
             compile_options = self._compile_options
         func._dsl_object.compile_options = compile_options

@@ -41,6 +41,7 @@ from .typing import (
     Int4,
     Int8,
     Int32,
+    FloatNV8E5M3FNU,
     BFloat16,
     Float32,
     IntTuple,
@@ -90,7 +91,10 @@ from .tuple import transform_leaf, product, product_like, flatten_to_tuple
 from .arch import (
     cvt_i8_bf16_intrinsic,
     cvt_i4_bf16_intrinsic,
+    cvt_f32x4_to_fnv8e5m3x4,
 )
+
+from cutlass._mlir_helpers.dominance import value_reaches_current_ip
 
 
 __all__ = [
@@ -157,14 +161,6 @@ class _Tensor(Tensor):
     # replacement.
     _pyir_ref_supported = True
 
-    # A ``_Tensor`` is a *descriptor* over memory (an iterator/pointer +
-    # layout), recomputable wherever its SSA value dominates.  This flag tells
-    # the staged-tracking layer to rematerialize its ref at the use site inside
-    # a nested region rather than routing it through an entry-block poison
-    # (which leaks for cross-region reads).  Declared here so the lower DSL
-    # layer stays decoupled from the cute dialect's MLIR type classes.
-    _pyir_memref_backed = True
-
     @dsl_user_op
     def __init__(
         self,
@@ -196,17 +192,7 @@ class _Tensor(Tensor):
             raise TypeError(f"Expected ir.Value or _Tensor, got {type(value)}")
 
         # Set iterator
-        iter_val = _cute_ir.get_iter(self.value, loc=loc, ip=ip)
-        if isinstance(iter_val, Pointer):
-            self._iterator = iter_val
-        elif isinstance(iter_val.type, _cute_ir.ArithTupleIteratorType):
-            itup_val = _cute_ir.deref_arith_tuple_iter(iter_val)
-            self._iterator = _unpack_x_tuple(itup_val)  # type: ignore[assignment]
-        elif isinstance(iter_val, ir.Value):
-            # SMEM descriptor iterator requires specific vec_mode layout configuration
-            self._iterator = iter_val
-        else:
-            raise TypeError(f"unsupported iterator type, got {type(iter_val)}")
+        self._iterator = self._derive_iterator(loc=loc, ip=ip)
 
         # Set dtype
         if self._dtype is None:
@@ -219,6 +205,36 @@ class _Tensor(Tensor):
                 self._dtype = None
             else:
                 raise TypeError(f"unsupported iterator type, got {type(self.iterator)}")
+
+    def _derive_iterator(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Union[Pointer, IntTuple, ir.Value]:
+        """Emit ``cute.get_iter`` for this tensor and classify the result.
+
+        The emitted op is *positional*: it is only usable where its block
+        dominates, whereas ``self.value`` may dominate a far wider scope.  A
+        wrapper constructed inside a nested region therefore carries a
+        region-local iterator even when its memref is function-scope; if the
+        wrapper outlives the region, the cached iterator becomes unusable.
+        ``iterator`` re-derives through here whenever the cached one cannot
+        reach the use site.
+
+        :raises TypeError: If iterator type is not supported
+        """
+        iter_val = _cute_ir.get_iter(self.value, loc=loc, ip=ip)
+        if isinstance(iter_val, Pointer):
+            return iter_val
+        elif isinstance(iter_val.type, _cute_ir.ArithTupleIteratorType):
+            itup_val = _cute_ir.deref_arith_tuple_iter(iter_val)
+            return _unpack_x_tuple(itup_val)
+        elif isinstance(iter_val, ir.Value):
+            # SMEM descriptor iterator requires specific vec_mode layout configuration
+            return iter_val
+        else:
+            raise TypeError(f"unsupported iterator type, got {type(iter_val)}")
 
     def __repr__(self) -> str:
         return self.__str__()
@@ -467,6 +483,11 @@ class _Tensor(Tensor):
     @property
     @lru_cache_ir()
     def iterator(self) -> Union[Pointer, IntTuple]:
+        if not value_reaches_current_ip(self._iterator):
+            # Minted in a region this use site cannot reach.  ``self.value`` is
+            # the tensor's anchor and does dominate, so re-derive rather than
+            # hand back an operand that would fail the dominance verifier.
+            self._iterator = self._derive_iterator()
         return self._iterator
 
     @property
@@ -857,6 +878,14 @@ def make_tensor(
     ):
         # SmemDescType requires specific vec_mode layout configuration
         res_ty = _cute_nvgpu_ir.SmemDescViewType.get(layout.type)  # type: ignore[union-attr]
+    # Handle SM107 SmemDesc type
+    elif isinstance(iterator, ir.Value) and isinstance(
+        iterator.type, _cute_nvgpu_ir.SmemDescSM107Type
+    ):
+        res_ty = _cute_nvgpu_ir.SmemDescViewType.get_with_smem_desc(
+            iterator.type,
+            layout.type,  # type: ignore[union-attr]
+        )
     else:
         raise TypeError(f"unsupported iterator type, got {type(iterator)}")
 
@@ -1155,6 +1184,8 @@ def recast_tensor(
         # Both tensors share the same memory, but interpret it differently
     """
     dst_width = None
+    if isinstance(dtype, _SparseElemType):
+        dst_width = dtype.width
     if dst_width is None:
         if not isclass(dtype) or not issubclass(dtype, Numeric):
             raise TypeError(f"dtype must be a type of Numeric, but got {dtype}")
@@ -2291,8 +2322,13 @@ class TensorSSA(Vector):
         :return: The element-wise negation of the tensor
         :rtype: TensorSSA
         """
-
-        return self._apply_op(operator.sub, 0, flip=True, loc=loc, ip=ip)
+        if self.dtype.is_float:
+            # Exact sign flip: -(+0.0) == -0.0. `0 - x` would give +0.0
+            # and cannot fold into a SASS negation modifier.
+            res_vect = arith.negf(self.maybe_downcast(), loc=loc, ip=ip)
+            return TensorSSA(res_vect, self._shape, self.dtype)
+        # No integer negf; use 0 - x with a typed zero to avoid promotion.
+        return self._apply_op(operator.sub, self.dtype(0), flip=True, loc=loc, ip=ip)
 
     @dsl_user_op
     def __abs__(
@@ -2512,6 +2548,12 @@ class TensorSSA(Vector):
                 loc: Optional[ir.Location],
                 ip: Optional[ir.InsertionPoint],
             ) -> ir.Value:
+                if (
+                    size(self.shape) == 4
+                    and self.dtype == Float32
+                    and dst_dtype == FloatNV8E5M3FNU
+                ):
+                    return cvt_f32x4_to_fnv8e5m3x4(src, loc=loc, ip=ip)
                 return cutlass_arith.cvtf(src, dst_dtype.mlir_type, loc=loc, ip=ip)
 
             res_vect = convert_fp_to_fp(src, dtype, loc, ip)

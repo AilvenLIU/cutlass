@@ -58,7 +58,6 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
@@ -169,7 +168,7 @@ class TgvGemmKernel:
         # acc_shape: ((Mma_M, Mma_N), NumMma_M, NumMma_N)
         acc_shape = tiled_mma.partition_shape_C((self.cta_m, self.cta_n))
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
-        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.num_tmem_alloc_cols = cutlass.memory.get_num_tmem_alloc_cols(tCtAcc_fake)
 
     @cute.jit
     def __call__(
@@ -183,9 +182,13 @@ class TgvGemmKernel:
         self.a_dtype = a.element_type
         self.b_dtype = b.element_type
         self.c_dtype = c.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            a
+        ).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            b
+        ).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
 
         self._setup_attributes()
 
@@ -356,9 +359,9 @@ class TgvGemmKernel:
             # Barrier between MMA and epilog: sync TMEM allocation/deallocation status
             tmem_allocation_result_barrier: cutlass.Int64
             # Base pointer for TMEM allocation, MMA will write the allocated address here
-            tmem_base_ptr: cutlass.Int32
+            tmem_base: cutlass.Int32
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Extract barrier pointers from struct
@@ -367,7 +370,7 @@ class TgvGemmKernel:
         tma_epilog_full_bar = storage.tma_epilog_full_barrier.ptr
         mma_epilog_full_bar = storage.mma_epilog_full_barrier.ptr
         tmem_alloc_result_bar = storage.tmem_allocation_result_barrier.ptr
-        tmem_base_smem_ptr = storage.tmem_base_ptr.ptr
+        tmem_base_smem_ptr = storage.tmem_base.ptr
 
         # ============================================================
         # Barrier initialization — ALL threads reach here, elect_one inits

@@ -28,19 +28,13 @@ import builtins
 
 from .utils.logger import log
 from .common import *
+from .common import DSLUserCodeError as DSLUserCodeError  # star-import re-export
 from .diagnostics import DiagId
-from .env_manager import get_str_env_var
 
-from .pyir_runtime import (  # noqa: F401 (re-exported via wildcard)
-    pyir_assign,
-    pyir_read,
-    pyir_function_scope,
-    pyir_promote_loop_body_arg,
-    _PYIR_SKIP,
-    _pyir_pre_subscript_assign,
-    _pyir_post_subscript_read,
-    _pyir_check_no_complex_m2m_call,
-)
+# Generated code names pyir_runtime symbols through the module alias the
+# rewriter binds in the function preamble; this import is for ast_helpers'
+# OWN use (if_selector witnesses trace-time predicate folds), not a re-export.
+from .pyir_runtime import _pyir_witness_predicate_fold
 from .multi_stage_manager import (  # noqa: F401 (re-exported via wildcard)
     enter_constexpr_loop,
     exit_constexpr_loop,
@@ -274,7 +268,9 @@ def loop_selector(
 
 def if_selector(pred: Any, write_args: list[Any] = []) -> Callable[..., Any]:
     log().debug("pred [%s] write_args [%s]", pred, write_args)
-    # Handle Numeric types here?
+    # Witness a trace-time fold of a watched META predicate so a later staged
+    # write of its source places refuses loudly. No-op for other predicates.
+    _pyir_witness_predicate_fold(pred)
 
     from .typing import Numeric
 
@@ -475,6 +471,20 @@ def assert_executor(test: Any, msg: str | None = None) -> None:
         )
 
 
+def bool_short_circuits(value: Any, short_circuit_value: bool) -> bool:
+    """True when the and/or LHS *value* short-circuits in Python: it is a
+    Python-truth bool -- a plain ``bool``, or a wrapper DECLARING a bool
+    payload through ``_pyir_raw_payload`` -- whose truth equals
+    *short_circuit_value*.  A staged or non-bool value answers False, so the
+    rewrite's other arm evaluates (the ``and_``/``or_`` helper)."""
+    if type(value) is bool:
+        return value == short_circuit_value
+    payload = getattr(value, "_pyir_raw_payload", None)
+    if type(payload) is bool:
+        return payload == short_circuit_value
+    return False
+
+
 def bool_cast(value: Any) -> bool:
     if executor._is_dynamic_expression(value):  # type: ignore[misc]
         raise DSLUserCodeError(
@@ -502,7 +512,31 @@ def compare_executor(left: Any, comparators: list[Any], ops: list[Any]) -> Any:
     assert executor._compare_executor is not None, (
         "Function must be set before execution."
     )
-    return executor._compare_executor(left, comparators, ops)
+    if "is" in ops or "is not" in ops:
+        # Identity legs over tracker-minted wrappers refuse-or-witness
+        # (LangRef 3.12 section 6.10.3); inert outside a PyIR trace scope.
+        from .pyir_core import _pyir_identity_compare_choke
+
+        _pyir_identity_compare_choke(left, comparators, ops)
+    result = executor._compare_executor(left, comparators, ops)
+    # Gate-once evidence (see pyir_state): record only the provable membership-gate
+    # shape (one ``not in`` over a plain set); clear on every other comparison.
+    try:
+        from .pyir_runtime import _PYIR_LAST_NOTIN_COMPARE
+
+        if (
+            len(ops) == 1
+            and ops[0] == "not in"
+            and type(result) is bool
+            and type(left) in (str, int, bool)
+            and type(comparators[0]) is set
+        ):
+            _PYIR_LAST_NOTIN_COMPARE[0] = (comparators[0], left, result)
+        else:
+            _PYIR_LAST_NOTIN_COMPARE[0] = None
+    except Exception:
+        pass
+    return result
 
 
 # =============================================================================

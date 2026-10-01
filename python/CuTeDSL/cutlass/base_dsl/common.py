@@ -38,10 +38,41 @@ _active_env_manager: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "active_env_manager", default=None
 )
 
-_CUDA_INVALID_LAUNCH_VALUE_ERRORS = {
-    "CUDA_ERROR_INVALID_VALUE",
-    "cudaErrorInvalidValue",
+_CUDA_ERROR_NAME_ALIASES = {
+    "cudaErrorNoKernelImageForDevice": "CUDA_ERROR_NO_BINARY_FOR_GPU",
+    "cudaErrorMemoryAllocation": "CUDA_ERROR_OUT_OF_MEMORY",
+    "cudaErrorInitializationError": "CUDA_ERROR_NOT_INITIALIZED",
 }
+
+
+def _cuda_error_lookup_key(error_name: str) -> str:
+    """Fold the driver and runtime spellings of one CUDA error onto one key.
+
+    The same failure reaches this module as ``CUDA_ERROR_INVALID_VALUE`` or as
+    ``cudaErrorInvalidValue`` depending on which CUDA API reported it, so tables
+    keyed by error name must not depend on the spelling. Pairs that differ by
+    more than case and punctuation are folded through
+    ``_CUDA_ERROR_NAME_ALIASES`` first.
+    """
+    canonical = _CUDA_ERROR_NAME_ALIASES.get(error_name, error_name).lower()
+    for prefix in ("cuda_error_", "cudaerror"):
+        if canonical.startswith(prefix):
+            canonical = canonical[len(prefix) :]
+            break
+    return canonical.replace("_", "")
+
+
+def _lookup_by_cuda_error(
+    table: Dict[str, Any], lookup_key: str, default: Any = ""
+) -> Any:
+    """Look up a table keyed by CUDA error name, ignoring the spelling."""
+    for name, value in table.items():
+        if _cuda_error_lookup_key(name) == lookup_key:
+            return value
+    return default
+
+
+_CUDA_INVALID_LAUNCH_VALUE_KEY = _cuda_error_lookup_key("CUDA_ERROR_INVALID_VALUE")
 
 
 def get_current_env_manager() -> Any:
@@ -124,7 +155,9 @@ def _dsl_excepthook(
         else:
             # Just print the formatted message (which is in __str__)
             print(str(exc_value), file=sys.stderr)
-        sys.exit(1)
+        # Don't kill an interactive session (REPL, `python -i`, PYTHONINSPECT)
+        if not (hasattr(sys, "ps1") or sys.flags.interactive or sys.flags.inspect):
+            sys.exit(1)
     else:
         # Use the original exception hook for other exceptions
         _original_excepthook(exc_type, exc_value, exc_traceback)
@@ -137,6 +170,11 @@ sys.excepthook = _dsl_excepthook
 # =============================================================================
 # DSL Exceptions
 # =============================================================================
+
+
+def _format_cause(cause: Any) -> str:
+    """Render an error's underlying cause, or empty string when there is none."""
+    return f"Caused exception: {cause}" if cause else ""
 
 
 class DSLBaseError(Exception):
@@ -171,9 +209,7 @@ class DSLBaseError(Exception):
         """
         Generates a string representation of the cause of the error, if available.
         """
-        if self.cause:
-            return f"Caused exception: {self.cause}"
-        return ""
+        return _format_cause(self.cause)
 
     # Subclasses may set this to True to render the "compiler bug, please
     # report" envelope instead of the "here is your mistake" block.  See
@@ -228,14 +264,15 @@ class DSLRuntimeError(DSLBaseError):
 
 
 _ARCH_RELATED_CUDA_ERRORS = frozenset(
-    {
+    _cuda_error_lookup_key(name)
+    for name in (
         "CUDA_ERROR_INVALID_SOURCE",
         "CUDA_ERROR_NO_BINARY_FOR_GPU",
         "CUDA_ERROR_INVALID_PTX",
         "CUDA_ERROR_UNSUPPORTED_PTX_VERSION",
         "CUDA_ERROR_NO_DEVICE",
         "CUDA_ERROR_INVALID_DEVICE",
-    }
+    )
 )
 
 
@@ -254,22 +291,23 @@ def _normalize_cuda_error_name(error_name: Union[str, bytes]) -> str:
 def _get_friendly_cuda_error_message(
     error_code: int, error_name: Union[str, bytes]
 ) -> tuple[str, str, Union[str, tuple[str, ...]]]:
+    """Get a user-friendly error message for common CUDA errors."""
     # Avoid circular dependency
     from .runtime.cuda import get_device_info
 
-    """Get a user-friendly error message for common CUDA errors."""
     error_name = _normalize_cuda_error_name(error_name)
+    lookup_key = _cuda_error_lookup_key(error_name)
 
     env_manager = get_current_env_manager()
     target_arch = env_manager.arch if env_manager is not None else "unknown"
-    arch_is_relevant = error_name in _ARCH_RELATED_CUDA_ERRORS
+    arch_is_relevant = lookup_key in _ARCH_RELATED_CUDA_ERRORS
     invalid_launch_value_suggestion = (
         "Check `.launch(...)`: grid, block, dynamic shared memory, stream, "
         "and attributes. Keep block.x * block.y * block.z <= "
         "maxThreadsPerBlock. If only threadIdx.x is used, launch with "
         "block=(threads, 1, 1)."
     )
-    if error_name in _CUDA_INVALID_LAUNCH_VALUE_ERRORS:
+    if lookup_key == _CUDA_INVALID_LAUNCH_VALUE_KEY:
         message = f"CUDA launch failed: {error_name} ({error_code})"
         return message, "", invalid_launch_value_suggestion
 
@@ -336,13 +374,13 @@ def _get_friendly_cuda_error_message(
         ),
         "cudaErrorInsufficientDriver": (
             "1. Run nvidia-smi to confirm CUDA driver version",
-            "2. Ensure the CUDA driver version meets the requirement of the installed cuda-python package",
+            "2. Ensure the CUDA driver version meets the requirement of the installed cuda-bindings package",
         ),
     }
 
     message = (
         f"{error_name} (error code: {error_code}) \n"
-        f"{additional_info.get(error_name, '')} \n\n{Colors.RESET}"
+        f"{_lookup_by_cuda_error(additional_info, lookup_key)} \n\n{Colors.RESET}"
     )
 
     # Add debug information
@@ -392,7 +430,7 @@ def _get_friendly_cuda_error_message(
             f"\n{Colors.YELLOW}ℹ️  Could not retrieve GPU info: {str(e)}{Colors.RESET}"
         )
 
-    return message, debug_info, error_suggestions.get(error_name, "")
+    return message, debug_info, _lookup_by_cuda_error(error_suggestions, lookup_key)
 
 
 class DSLCudaRuntimeError(DSLBaseError):
@@ -413,7 +451,8 @@ class DSLCudaRuntimeError(DSLBaseError):
         self._error_name = error_name
         normalized_error_name = _normalize_cuda_error_name(error_name)
         concise_launch_error = (
-            normalized_error_name in _CUDA_INVALID_LAUNCH_VALUE_ERRORS
+            _cuda_error_lookup_key(normalized_error_name)
+            == _CUDA_INVALID_LAUNCH_VALUE_KEY
         )
         if concise_launch_error:
             self.code = "CUDA_LAUNCH_INVALID_CONFIG"
@@ -508,7 +547,7 @@ class DSLWarning(UserWarning):
         super().__init__(_render_user_diagnostic(self))
 
     def _generate_cause(self) -> str:
-        return f"Caused exception: {self.cause}" if self.cause else ""
+        return _format_cause(self.cause)
 
 
 class DSLNotImplemented(DSLBaseError):
@@ -695,13 +734,12 @@ class DSLOperationBuildError(DSLBaseError):
                       automatically captures the caller's frame
             auto_translate: If True, attempt to translate MLIR/nanobind errors
         """
-        import inspect
-
         # If frameInfo not provided, capture the caller's frame information
         if frameInfo is None:
             current_frame = inspect.currentframe()
             frame = current_frame.f_back if current_frame else None
             frameInfo = inspect.getframeinfo(frame) if frame else None
+            del current_frame
 
         # Try to translate MLIR/nanobind errors if no custom message provided
         self.original_error = str(message)
